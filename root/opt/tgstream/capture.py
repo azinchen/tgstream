@@ -1147,10 +1147,13 @@ class Capture:
                 if state == "join-failed":
                     STATE.set(state="idle")
                 return
-            # Back off after repeated failures so a broken join selector
-            # doesn't hammer the page every poll.
+            # Back off after repeated failures: each attempt costs a full
+            # browser relaunch + JOIN_TIMEOUT, and a channel with a phantom
+            # call (bar up, no playable video - some channels idle that way
+            # for hours) would otherwise burn a CPU core relaunching Chromium
+            # every minute.
             if state == "join-failed" and self.join_failures >= 3 \
-                    and time.monotonic() - self.last_join_attempt < 60:
+                    and time.monotonic() - self.last_join_attempt < 300:
                 return
             STATE.set(state="joining", title=title)
             self.last_join_attempt = time.monotonic()
