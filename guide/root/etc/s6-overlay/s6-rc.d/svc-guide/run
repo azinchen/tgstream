@@ -58,9 +58,13 @@ build_epg()
         printf '  </channel>\n'
     done
 
-    jq -r '.[] | [.slug, .name, .state, (.title // ""), (.since_ts // 0 | floor)] | @tsv' \
+    # Field separator is the unit separator (0x1f), NOT tab: tab is
+    # IFS-whitespace, so an empty title field (live channels) would collapse
+    # with the adjacent tab and shift since_ts out of place.
+    US="$(printf '\037')"
+    jq -r --arg us "$US" '.[] | [.slug, .name, .state, (.title // ""), (.since_ts // 0 | floor)] | join($us)' \
         "$status_file" \
-    | while IFS="$(printf '\t')" read -r slug name state title since_ts; do
+    | while IFS="$US" read -r slug name state title since_ts; do
         if [ "$state" = "live" ]; then
             [ -n "$title" ] || title="$name live"
             printf '  <programme start="%s" stop="%s" channel="%s">\n' \
