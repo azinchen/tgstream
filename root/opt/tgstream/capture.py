@@ -400,15 +400,21 @@ STAGE_VIDEO_JS = """
     v.controls = false;
     // Telegram live streams are rewindable and the player opens at the
     // buffer position, not the live edge - which can be hours behind.
-    // Seek to the live edge; the 15s guard re-seeks only on real lag.
+    // Seek ONCE per staged element (dataset flag): re-seeking every tick
+    // never lets the player finish rebuffering at the new position.
+    let seeked = false;
     try {
-        if (v.seekable && v.seekable.length) {
+        if (!v.dataset.tgstreamSeeked && v.seekable && v.seekable.length) {
             const edge = v.seekable.end(v.seekable.length - 1);
-            if (edge - v.currentTime > 15) v.currentTime = Math.max(0, edge - 2);
+            if (edge - v.currentTime > 15) {
+                v.currentTime = Math.max(0, edge - 2);
+                seeked = true;
+            }
+            v.dataset.tgstreamSeeked = '1';
         }
     } catch (e) {}
     v.play().catch(() => {});
-    return true;
+    return seeked ? 'seeked' : true;
 })()
 """
 
@@ -1175,7 +1181,13 @@ class Capture:
             # Re-stage every tick: idempotent, and upgrades to the player's
             # main video if a thumbnail was staged before it finished loading.
             try:
-                self.browser.evaluate(STAGE_VIDEO_JS)
+                if self.browser.evaluate(STAGE_VIDEO_JS) == "seeked":
+                    # Seeking to the live edge stalls playback for a few
+                    # seconds while the player rebuffers - don't let the
+                    # stall watchdog count that time.
+                    self.last_video_ok = now
+                    self.last_clock = None
+                    return
             except BrowserError:
                 pass
             if self.video_advancing():
@@ -1187,7 +1199,7 @@ class Capture:
             if now - self.last_video_ok > CFG["end_grace"]:
                 log("Video gone past END_GRACE - ending stream")
                 self.end_stream()
-            elif live and now - self.last_video_ok > 10:
+            elif live and now - self.last_video_ok > 20:
                 log("Video stalled while still live - rejoining")
                 self.rejoin_page()
                 self.probe_live()  # re-mark the bar for join()
