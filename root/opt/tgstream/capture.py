@@ -990,8 +990,12 @@ class Capture:
     # -- join ---------------------------------------------------------------
 
     def rejoin_page(self):
-        self.browser.reload()
-        time.sleep(3)
+        # A reload auto-rejoins the previous (possibly stuck) call and K
+        # never auto-opens the player for a rejoined call. Only a fresh
+        # browser boot reliably resets to the pre-join Join bar.
+        self.browser.close()
+        self.browser.launch(self.channel_url())
+        time.sleep(8)
 
     def join(self):
         """Click into the live stream and stage its <video>. True on success."""
