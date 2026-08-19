@@ -1,8 +1,7 @@
 #!/bin/sh
 # shellcheck shell=sh
-# Healthy while /status answers, except when the container has been sitting
-# in needs-login for over 10 minutes - that needs a human with a phone, and
-# an unhealthy flag in `docker ps` is the signal.
+# Healthy while /status answers, except after 10 minutes stuck in
+# needs-login (needs a human with a phone).
 
 set -eu
 

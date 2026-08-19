@@ -1,9 +1,9 @@
 #!/bin/sh
 # shellcheck shell=sh
-# Generate the idle slate loop published to MediaMTX while no stream is live.
-# It MUST match the live capture's codec profile (H.264 High, yuv420p, AAC
-# 48kHz stereo) because it is published with -c copy onto the same path the
-# live encode later continues.
+# Generate the idle slate segment (MPEG-TS) shown as HLS filler when no
+# stream is live, so Plex/Jellyfin never see a dead tuner. An
+# EXT-X-DISCONTINUITY separates slate from live, so codecs need not match
+# the live stream exactly - but H.264 High / AAC 48k keeps players happy.
 
 set -eu
 
@@ -11,18 +11,14 @@ set -eu
 
 SCRIPT_NAME="MAKE-SLATE"
 
-WIDTH="${CAPTURE_WIDTH:-1920}"
-HEIGHT="${CAPTURE_HEIGHT:-1080}"
-FPS="${CAPTURE_FPS:-30}"
+WIDTH="${SLATE_WIDTH:-1280}"
+HEIGHT="${SLATE_HEIGHT:-720}"
 NAME="${TG_NAME:-${TG_SLUG:-telegram}}"
 
 SLATE="/state/slate.ts"
 PARAMS="/state/slate.params"
-
-# drawtext treats these as syntax; keep the visible name but strip them.
 SAFE_NAME="$(printf '%s' "$NAME" | tr -d "':\\\\%")"
-
-signature="${WIDTH}x${HEIGHT}@${FPS} ${SAFE_NAME}"
+signature="${WIDTH}x${HEIGHT} ${SAFE_NAME}"
 
 if [ -s "$SLATE" ] && [ -f "$PARAMS" ] && [ "$(cat "$PARAMS")" = "$signature" ]; then
     log "$SCRIPT_NAME" "Slate is up to date (${signature})"
@@ -30,16 +26,15 @@ if [ -s "$SLATE" ] && [ -f "$PARAMS" ] && [ "$(cat "$PARAMS")" = "$signature" ];
 fi
 
 log "$SCRIPT_NAME" "Generating slate: ${signature}"
-
 fontfile="/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"
 
 ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "color=c=0x101820:s=${WIDTH}x${HEIGHT}:r=${FPS}" \
+    -f lavfi -i "color=c=0x101820:s=${WIDTH}x${HEIGHT}:r=25" \
     -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000" \
     -t 10 \
     -vf "drawtext=fontfile=${fontfile}:text=${SAFE_NAME}:fontcolor=white:fontsize=h/12:x=(w-text_w)/2:y=(h-text_h)/2-h/16,drawtext=fontfile=${fontfile}:text=no live stream:fontcolor=0x8899aa:fontsize=h/24:x=(w-text_w)/2:y=(h-text_h)/2+h/12" \
     -c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p \
-    -b:v 1000k -g "$((FPS * 2))" \
+    -b:v 1000k -g 50 \
     -c:a aac -ar 48000 -ac 2 -b:a 128k \
     -f mpegts "$SLATE"
 

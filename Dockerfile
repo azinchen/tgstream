@@ -66,48 +66,32 @@ LABEL org.opencontainers.image.authors="Alexander Zinchenko <alexander@zinchenko
 
 ENV S6_BEHAVIOUR_IF_STAGE2_FAILS=2 \
     S6_CMD_WAIT_FOR_SERVICES_MAXTIME=120000 \
-    DISPLAY=:99 \
-    PULSE_RUNTIME_PATH=/run/pulse \
-    PULSE_SERVER=unix:/run/pulse/native \
     PYTHONUNBUFFERED=1
 
+# MTProto capture: no browser. Telethon pulls the stream chunks; ffmpeg
+# remuxes (-c copy) and generates the slate; qrencode renders the login QR.
 RUN echo "**** install mandatory packages ****" && \
     apk --no-cache --no-progress add \
-        busybox-extras=1.37.0-r31 \
-        chromium=151.0.7922.108-r0 \
         curl=8.21.0-r0 \
-        dbus=1.16.2-r2 \
         ffmpeg=8.1.2-r0 \
         font-dejavu=2.37-r6 \
         font-noto=2026.06.01-r0 \
         jq=1.8.1-r0 \
         libqrencode-tools=4.1.1-r3 \
-        libva=2.23.0-r0 \
-        libva-utils=2.23.0-r0 \
-        mesa-va-gallium=26.1.6-r0 \
-        pulseaudio=17.0-r7 \
-        py3-websocket-client=1.9.0-r1 \
+        py3-pyaes=1.6.1-r7 \
+        py3-rsa=4.9.1-r1 \
+        py3-telethon=1.43.2-r0 \
         python3=3.14.7-r1 \
         tzdata=2026c-r0 \
-        x11vnc=0.9.17-r1 \
-        xvfb=21.1.24-r0 \
         && \
-    echo "**** install x86-only Intel VAAPI drivers ****" && \
-    if [ "${TARGETARCH}" = "amd64" ]; then \
-    apk --no-cache --no-progress add \
-        intel-media-driver=26.2.1-r0 \
-        libva-intel-driver=2.4.1-r2 \
-        ; fi && \
     echo "**** cleanup ****" && \
     rm -rf /tmp/* /var/cache/apk/*
 
 COPY --from=rootfs-builder /rootfs/ /
 
-# /status answers in capture and guide mode; login mode is interactive and
-# always reports healthy. start-period covers slate generation + browser boot.
-HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/tgstream-healthcheck"]
 
-EXPOSE 8409 5900
+EXPOSE 8409
 
 ENTRYPOINT ["/usr/local/bin/entrypoint"]

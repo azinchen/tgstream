@@ -8,22 +8,18 @@ set -eu
 SCRIPT_NAME="INIT-TGSTREAM"
 
 log "$SCRIPT_NAME" "Preparing runtime directories"
-mkdir -p "${PULSE_RUNTIME_PATH:-/run/pulse}"
+mkdir -p /run/tgstream/hls /run/tgstream/rec /state
 
-TG_SLUG="${TG_SLUG:-}"
-TG_PEER="${TG_PEER:-}"
-
-[ -n "$TG_SLUG" ] || die "$SCRIPT_NAME" "TG_SLUG is required"
-[ -n "$TG_PEER" ] || die "$SCRIPT_NAME" "TG_PEER is required"
+[ -n "${TG_SLUG:-}" ] || die "$SCRIPT_NAME" "TG_SLUG is required"
+[ -n "${TG_PEER:-}" ] || die "$SCRIPT_NAME" "TG_PEER is required"
+[ -n "${API_ID:-}" ] || die "$SCRIPT_NAME" "API_ID is required (my.telegram.org)"
+[ -n "${API_HASH:-}" ] || die "$SCRIPT_NAME" "API_HASH is required (my.telegram.org)"
 case "$TG_SLUG" in
     *[!a-z0-9-]*) die "$SCRIPT_NAME" "TG_SLUG must match [a-z0-9-] (got '${TG_SLUG}')" ;;
 esac
 
-# The Telegram session lives in this container's own browser profile; the
-# integrated QR login (capture.py) fills it on first start and it persists
-# on the /state volume from then on.
-mkdir -p /state/profile
-
+# The Telegram MTProto session lives in this channel's own /state volume;
+# integrated QR login (capture.py) fills it on first start.
 make-slate
 
 log "$SCRIPT_NAME" "Initialization completed for channel '${TG_SLUG}'"

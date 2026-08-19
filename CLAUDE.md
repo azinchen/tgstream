@@ -3,27 +3,31 @@
 Watch Telegram channels for live streams (group calls), restream them to Plex
 and Jellyfin as live TV, and save each stream to a file for offline viewing.
 
-**Status: implemented (Phase 1, untested against a real live stream).** This
-document is the design record; it exists so the decisions below are not
-re-litigated. Where it says "decided", treat it as settled unless the
-implementation turns up a fact that contradicts the stated rationale.
+**Status: implemented and verified against real live streams — MTProto
+capture, no browser.** This document is the design record; it exists so the
+decisions below are not re-litigated. Where it says "decided", treat it as
+settled unless the implementation turns up a fact that contradicts the stated
+rationale.
 
-Implementation conventions: single image, **Alpine** base with **pinned apk
-versions**, s6-overlay v3 supervised, following the layout and style of
-`~/projects/nordvpn` (multi-stage Dockerfile with s6-builder/rootfs-builder
-stages, `root/` overlay tree, `init-*` oneshots and `svc-*` longruns, shared
-`backend-functions`, banner entrypoint that execs `/init`). No
-Claude/Anthropic attribution in commits or PRs.
+**MAJOR ARCHITECTURE CHANGE (2026-08): browser capture replaced by direct
+MTProto.** The original design captured video by screen-grabbing Chromium on
+Telegram Web (see the superseded §3.1). Testing against real streams proved
+that path delivers ~5fps, DVR replays instead of the live edge, A/V desync,
+and re-encode quality loss. It was replaced by pulling the RTMP broadcast's
+media chunks directly over MTProto and remuxing them with `-c copy`. This
+eliminated Chromium, Xvfb, PulseAudio, x11vnc, VAAPI, **and MediaMTX**, cut
+the image from ~930MB to ~230MB and CPU from ~2 cores to ~0.1, and gave full
+source quality, true live edge, and structural A/V sync. See §3.1.
 
-**No Playwright, no pip** (user directive: prefer Alpine and plain scripts).
-Playwright is glibc-only and cannot run on musl; the browser is Alpine's
-packaged `chromium` driven over raw CDP (`Page.navigate`, `Page.reload`,
-`Runtime.evaluate`) via `py3-websocket-client` (apk). Guide and login are
-pure shell (`curl` + `jq` + busybox httpd serving static files refreshed on a
-loop). `capture.py` stays Python deliberately: it correlates CDP responses
-with async events on a long-lived websocket and supervises the state machine
-- in shell that would be the least debuggable code at the most fragile spot.
-Do not rewrite it in shell without a concrete reason.
+Implementation conventions: **Alpine** base with **pinned apk versions**,
+s6-overlay v3 supervised, following the layout and style of `~/projects/
+nordvpn`. **No pip** (user directive): `py3-telethon` from apk, `ffmpeg` CLI
+for remux/slate/harvest (PyAV ships musllinux wheels and works on Alpine, but
+would need pip, so it is deliberately avoided — the audio-duration parse that
+PyAV made easy is a ~30-line pure-Python MP4 box scanner in `capture.py`).
+Guide is pure shell (`curl` + `jq` + busybox httpd). `capture.py` is Python:
+it runs the Telethon async client, the download pipeline, and the state
+machine. No Claude/Anthropic attribution in commits or PRs.
 
 ---
 
@@ -50,16 +54,11 @@ a ZFS pool at `/tank`. User has Plex Pass. Existing appdata convention is
 ## 2. Architecture
 
 ```
-tg-<slug>  ── Chromium/Xvfb on Telegram Web ── ffmpeg ──RTMP──┐
-tg-<slug>  ── Chromium/Xvfb on Telegram Web ── ffmpeg ──RTMP──┤
-                                                             ▼
-                                                         MediaMTX
-                                                             │
-                              ┌──────────────────────────────┴───────────┐
-                              │ HLS                          MPEG-TS segments
-                              ▼                                          │
-                          guide (M3U + XMLTV)                            ▼
-                              │                              harvest ──► /library
+tg-<slug>  ── MTProto: join call, pull 1s chunks ── ffmpeg -c copy ──┐
+tg-<slug>  ── MTProto: join call, pull 1s chunks ── ffmpeg -c copy ──┤ HLS + MPEG-TS
+                              ┌──────────────────────────────────────┤       │
+                              │                                       ▼       ▼
+                          guide (M3U + XMLTV + HDHomeRun)        harvest ──► /library
                               ▼
                      Plex / Jellyfin Live TV
 ```
@@ -68,9 +67,14 @@ Components:
 
 | Name | Count | Base image | Role |
 |---|---|---|---|
-| `mediamtx` | 1 | `bluenviron/mediamtx` | RTMP in, HLS out, segment recording |
-| `tgstream-capture` | N | Playwright python | one channel: detect, join, encode, harvest |
-| `tgstream-guide` | 1 | `python:3.12-slim` | merge per-channel `/status` into one M3U + XMLTV |
+| `tgstream` (capture) | N | `alpine` (~230MB) | one channel: MTProto detect+join+pull, remux, serve HLS/TS, harvest |
+| `tgstream-guide` | 1 | `alpine` (~20MB) | merge per-channel `/status` into one M3U + XMLTV + HDHomeRun tuner |
+
+**No MediaMTX.** Each capture container serves its own live HLS
+(`/stream.m3u8`), continuous MPEG-TS (`/stream.ts`, for Plex's HDHomeRun
+client), and rolling segments on its HTTP port; it records by archiving those
+segments and concatenating on stream end. MediaMTX's roles (RTMP-in→HLS,
+recording, slate) all moved into the capture container.
 
 **Two published images** (user directive, for public GitHub + GHCR
 publishing): `ghcr.io/azinchen/tgstream` is the capture container (with
@@ -89,39 +93,53 @@ secrets: `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` (login, cleanup) and
 
 ## 3. Decisions and rationale
 
-### 3.1 Capture via browser, not MTProto — DECIDED
+### 3.1 Capture over MTProto, not browser — DECIDED (was: browser)
 
-The mature Telegram call libraries (pytgcalls and relatives) are built for
-pushing media *into* group calls, not pulling a broadcast out. The extraction
-implementations that exist handle audio and pad the video track with a black
-loop. Browser capture is the only route that reliably gets video.
+Original decision was browser capture (screen-grab Chromium on Telegram Web),
+on the belief that pytgcalls-family libraries only push media *into* calls and
+can't pull a broadcast out. That belief was too broad. **Telegram RTMP
+broadcasts** (what news/streamer channels use — OBS pushing RTMP) are
+server-transcoded and delivered to clients as ~1-second standalone-MP4 chunks
+over plain MTProto file requests. A normal Telethon client can pull them:
 
-Second reason, specific to this use case: private channels with the
-`noforwards` content-protection flag block every API-based download path.
-Browser capture is immune.
+1. `channels.getFullChannel` → `full_chat.call` (the `InputGroupCall`); None
+   ⇒ idle, present ⇒ live. This is also the detector (§3.2).
+2. `phone.joinGroupCall` with a **minimal presence payload** — empty
+   fingerprints + an arbitrary ssrc, no WebRTC/DTLS handshake. This is the one
+   non-obvious requirement: `getFile` returns `GROUPCALL_JOIN_MISSING` until
+   you've joined, but joining needs no native tgcalls/ntgcalls layer.
+3. `phone.getGroupCallStreamChannels` → `last_timestamp_ms`, `scale`
+   (segment_ms = `1000 >> scale`, in practice scale 0 = 1000ms). Live position
+   = round down, minus a small buffer.
+4. `upload.getFile(InputGroupCallStream(call, time_ms, scale, video_channel=1,
+   video_quality))` → one chunk = 32-byte Telegram header + a standalone MP4
+   (ftyp/mdat/moov) with H.264 + AAC muxed. `video_channel=1` is the muxed A/V
+   track (0 is audio-only, 2 is a low-rate preview at scale −5).
+   `TIME_TOO_BIG` = caught up to live; `TIME_TOO_SMALL` = expired, skip;
+   `TIME_INVALID` = the call restarted, rejoin.
 
-### 3.2 Live *detection* — OPEN, decide during Phase 1
+Each chunk is remuxed `-c copy` to an MPEG-TS HLS segment. Verified against
+real streams: full 720p25 H.264 + AAC, true live edge, structural A/V sync,
+~0.1 CPU. Measured facts: source ≈ 1.04× realtime, fetch ≈ 3 chunks/s, so a
+**producer/consumer pipeline** (fetch decoupled from remux) keeps it ahead of
+realtime; a plain fetch-then-remux loop summed the latencies and fell behind.
 
-Two options, and this is the one genuinely unresolved question.
+`noforwards` does **not** block this — clients must fetch these chunks to play
+at all, so a member account can too (verified live). The account must be a
+member of the channel.
 
-**(a) DOM detection.** Chromium stays resident on the channel and watches for
-the live-stream topbar. No API credentials, no session file, one dependency
-chain. Cost: ~400MB RSS per idle channel, and the topbar selectors carry both
-detection *and* joining — a Telegram Web rename makes the channel go silently
-quiet rather than failing loudly.
+**Known limitation:** phone-camera group *video chats* are WebRTC, not RTMP
+broadcasts — those are not capturable this way (nor by Telegram Web K, which
+renders them audio-only). Virtually all "live stream" channels use RTMP.
 
-**(b) MTProto detection (Telethon).** Poll `channels.getFullChannel` and read
-`full_chat.call`, accelerated by raw `UpdateGroupCall` events. Idle channels
-run no browser at all (~30MB), and detection is robust against UI churn.
+### 3.2 Live detection — DECIDED (MTProto, free)
 
-The blocker for (b) under container-per-channel: **N containers cannot share
-one Telethon session file.** Copies of the same auth key used concurrently earn
-`AUTH_KEY_DUPLICATED` and a revoked session. Authorizing each container
-separately means N logins and N sessions on the account to answer one boolean.
-
-Resolution: **build Phase 1 with (a)**, but put detection behind a narrow
-interface — `is_live(slug) -> (bool, title)` — so Phase 2 can swap it without
-touching capture logic. See §4.
+Detection is `channels.getFullChannel` → `full_chat.call is None`. No browser,
+no selectors, no separate mechanism — it falls out of the capture path. The
+old §3.2 open question (DOM vs Telethon, and the `AUTH_KEY_DUPLICATED` worry
+about sharing one session across N containers) is moot: each capture container
+owns its own MTProto session in `/state` (one QR scan per channel), exactly as
+each was already its own browser session.
 
 > Correction carried forward from planning: an earlier version of this design
 > claimed container-per-channel *causes* the 400MB-per-channel RAM cost. It
@@ -243,60 +261,55 @@ default.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TG_SLUG` | *required* | `[a-z0-9-]`; MediaMTX path is `tg-<slug>` |
+| `TG_SLUG` | *required* | `[a-z0-9-]`; stream path is `tg-<slug>` |
 | `TG_PEER` | *required* | channel id, `@username`, or `t.me/+invite` URL |
+| `API_ID` / `API_HASH` | *required* | Telegram app creds (my.telegram.org) |
 | `TG_NAME` | slug | display name in the guide |
 | `TG_CHANNEL_NUMBER` | `1` | guide ordering |
-| `CAPTURE_WIDTH` / `_HEIGHT` / `_FPS` | `1920` / `1080` / `30` | capture geometry |
-| `CAPTURE_BITRATE` | `4500k` | video bitrate |
-| `CAPTURE_ENCODER` | `cpu` | `cpu` (libx264), `vaapi` (x86 GPU), `v4l2m2m` (Raspberry Pi 4) |
-| `VAAPI_DEVICE` | `/dev/dri/renderD128` | render node for `vaapi`; Intel drivers (iHD + i965) are x86-only and installed conditionally on amd64 — arm64 gets Mesa only, so `vaapi` is amd64-only |
 | `RECORD` | `true` | write finished streams to `/library` |
+| `VIDEO_QUALITY` | `2` | Telegram stream quality tier for `getFile` |
 | `POLL_INTERVAL` | `5` | seconds between liveness checks |
-| `END_GRACE` | `45` | seconds to ride out a flapping stream before ending |
-| `JOIN_TIMEOUT` | `45` | seconds to wait for a playing `<video>` |
-| `RTMP_URL` | `rtmp://mediamtx:1935` | |
-| `PUBLIC_HOST` | — | must resolve from Plex, Jellyfin **and** clients |
-| `HLS_PORT` / `HTTP_PORT` | `8888` / `8409` | |
-| `DEBUG_VNC` | `false` | expose the browser on 5900 for debugging |
+| `BUFFER_MS` | `2000` | how far behind live to start (latency vs stability) |
+| `HLS_WINDOW` / `HLS_GRACE` | `12` / `8` | playlist window / extra segments kept (404 guard) |
+| `PUBLIC_HOST` | `localhost` | must resolve from Plex, Jellyfin **and** clients |
+| `HTTP_PORT` | `8409` | in-container port |
+| `PUBLIC_HTTP_PORT` | `HTTP_PORT` | host-published port (for the `/login` URL) |
 
-`TG_SLUG` becomes the MediaMTX path *and* the library folder name. Changing it
-after recordings exist orphans them.
+No encode settings: capture is `-c copy` at the source quality/resolution, so
+there is no `CAPTURE_*`, `VAAPI`, `RTMP_URL`, `shm_size`, or `/dev/dri`.
+`TG_SLUG` becomes the library folder name — changing it orphans recordings.
 
 ### 5.2 HTTP endpoints
 
-Capture container, on `HTTP_PORT`:
+Capture container, on `HTTP_PORT` (all media + control on one port):
 
-- `GET /playlist.m3u` — one `#EXTINF` entry for this channel
-- `GET /epg.xml` — XMLTV for this channel
+- `GET /stream.m3u8` — live HLS (slate loop when idle)
+- `GET /stream.ts` — never-ending MPEG-TS (Plex's HDHomeRun client)
+- `GET /s<N>.ts` — HLS segments
+- `GET /playlist.m3u`, `GET /epg.xml` — one-channel M3U / XMLTV
 - `GET /status` — JSON: `slug`, `name`, `path`, `channel_number`, `state`,
   `title`, `since`, `since_ts`, `url`, `record`, `last_error`
-- `GET /login` — QR login page (auto-refreshing QR, 2FA password form)
-- `GET /qr.png` — the current mirrored login QR (404 when authorized)
-- `POST /login/password` — 2FA cloud password; typed into the page via CDP
+- `GET /login`, `GET /qr.png`, `POST /login/password` — integrated QR login
 
-`state` is one of `starting | needs-login | idle | joining | live |
-join-failed`. In `needs-login` the container also prints the QR to the log
-(via vendored jsQR + `qrencode -t UTF8`) on every ~30s token rotation, and
-the healthcheck reports unhealthy after 10 minutes of waiting.
+`state` is one of `starting | needs-login | idle | live`. In `needs-login` the
+container prints the QR to the log (`qrencode -t UTF8`) on each ~30s token
+rotation; the healthcheck goes unhealthy after 10 minutes of waiting.
 
-Guide container serves `/status`, `/playlist.m3u`, `/epg.xml`, merged.
-`UPSTREAMS` is a comma-separated list of capture base URLs.
+Guide serves merged `/status`, `/playlist.m3u`, `/epg.xml`, and the HDHomeRun
+endpoints (`/discover.json`, `/lineup.json`, `/lineup_status.json`) whose
+lineup URLs point at each capture's `/stream.ts`. `UPSTREAMS` is a
+comma-separated list of capture base URLs.
 
 ### 5.3 Volumes
 
 | Path | Mode | Scope |
 |---|---|---|
-| `/state` | rw | **per channel** — browser profile (Telegram session), slate |
-| `/segments` | rw | shared with MediaMTX |
-| `/library` | rw | shared; only mounted if `RECORD=true` |
+| `/state` | rw | **per channel** — MTProto session (`session.session`), slate |
+| `/library` | rw | shared; finished recordings |
 
-There is no shared `/session` volume: each capture container owns its
-Telegram session (integrated QR login, one scan per channel), which avoids
-the `AUTH_KEY_DUPLICATED` risk of cloning one auth key into several
-concurrently-connected browsers. This supersedes §3.8.
-
-`shm_size: 1gb` is required — Chromium crashes tabs on the default 64MB.
+Live segments live in `/run/tgstream` (tmpfs), rotated automatically — no
+shared segment volume. Each capture container owns its MTProto session in
+`/state` (one QR scan per channel).
 
 ### 5.4 Recording output
 
@@ -349,43 +362,38 @@ to `evaluate` is relaunched.
 
 ## 8. Repository layout (as implemented)
 
-- `Dockerfile` — s6-builder → rootfs-builder → `alpine:3.22` main stage with
-  pinned apk packages: chromium, ffmpeg, Xvfb, PulseAudio, x11vnc, jq,
-  python3, py3-websocket-client, busybox-extras (httpd).
-- `root/usr/local/bin/` — `entrypoint` (mode → s6 user bundle),
+- `Dockerfile` — s6-builder → rootfs-builder → `alpine:3.24` main stage with
+  pinned apk packages: ffmpeg, py3-telethon (+ py3-pyaes, py3-rsa),
+  libqrencode-tools, fonts, jq, curl, python3. No browser.
+- `root/usr/local/bin/` — `entrypoint` (banner → `/init`),
   `backend-functions`, `make-slate`, `tgstream-healthcheck`.
-- `root/etc/s6-overlay/s6-rc.d/` — `init-tgstream` (validate env, clone
-  profile, slate), `svc-xvfb`, `svc-pulseaudio` (null sink `tgcap`),
-  `svc-x11vnc` (DEBUG_VNC only), `svc-capture`.
-- `root/opt/tgstream/capture.py` — detection interface, CDP browser client,
-  join, ffmpeg supervisor, harvest, stdlib HTTP endpoints.
+- `root/etc/s6-overlay/s6-rc.d/` — `init-tgstream` (validate env, slate),
+  `svc-capture`; static `user/contents.d`.
+- `root/opt/tgstream/capture.py` — Telethon MTProto client, QR login,
+  detection, download pipeline (producer/consumer), ffmpeg-CLI remux, HLS +
+  MPEG-TS serving, slate loop, recorder/harvest. Includes the pure-Python MP4
+  audio-duration parser (gapless timeline: advance offset by the chunk's real
+  ~1003ms audio duration, not a fixed 1000ms grid, or the AAC decoder drops a
+  frame per second — the audio-drop bug).
 - `guide/` — the separate guide image: own `Dockerfile` and `root/` with
-  `svc-guide` (shell refresh loop writing /run/guide) and `svc-guide-httpd`
-  (busybox httpd), static s6 user bundle, no modes.
-- `config/mediamtx.yml`, `docker-compose.yml` (`x-capture` anchor, `login`
-  under a compose profile), `.env.example`, `README.md`.
+  `svc-guide` (shell refresh loop writing /run/guide, incl. HDHomeRun JSON)
+  and `svc-guide-httpd` (busybox httpd), static s6 user bundle.
+- `docker-compose.yml` (`x-capture` anchor), `.env.example`, `README.md`.
 
-Host paths are **not hardcoded**: `.env` defines `APPDATA_DIR` (session,
-per-channel state, segments) and `LIBRARY_DIR` (finished recordings);
-`/tank/appdata/tgstream` and `/tank/media/telegram` are only the example
-defaults. `TZ` must match between mediamtx and capture containers because
-harvest parses local-time segment filenames.
+Host paths are **not hardcoded**: `.env` defines `APPDATA_DIR` (per-channel
+state) and `LIBRARY_DIR` (recordings); `/tank/appdata/tgstream` and
+`/tank/media/telegram` are only the example defaults.
 
 ---
 
-## 9. Verifying without a live stream
+## 9. Verifying
 
-The hard part to test is the one thing that only happens when a stream starts.
-
-- **Slate path**: bring up one container with no live stream; confirm the
-  MediaMTX path publishes and `curl http://<host>:8888/tg-<slug>/index.m3u8`
-  returns a playlist.
-- **Detection**: `DEBUG_VNC=true`, attach a VNC client, and start a group call
-  in a throwaway channel you own. This is also how you refresh the selector
-  list when it breaks.
-- **Harvest**: independent of Telegram. Drop hand-made TS segments into
-  `/segments/tg-<slug>/` with correctly formatted timestamp filenames and call
-  the harvest function with a window that overlaps them.
+- **Slate/idle**: bring up a container with no live stream; `curl
+  http://<host>:<port>/stream.m3u8` returns the slate HLS.
+- **Detection + capture**: point at a channel that is actually live (RTMP
+  broadcast, member account); state goes `idle → live`, `/stream.m3u8` and
+  `/stream.ts` serve real video within seconds.
+- **Recording**: on stream end the segments concat to `/library/<Name>/…mp4`.
 - **Guide**: stub the upstreams with a static JSON server; verify a dead
   upstream degrades to a shorter playlist rather than a 500.
 - **Plex/Jellyfin wiring**: pair the tuner against the slate-only stream first.

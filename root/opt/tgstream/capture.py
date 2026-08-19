@@ -1,41 +1,38 @@
 #!/usr/bin/env python3
-"""tgstream capture: watch one Telegram channel, restream its live streams to
-MediaMTX and harvest finished streams into the library.
+"""tgstream capture: pull one Telegram channel's live stream directly over
+MTProto (no browser) and serve it as HLS + MPEG-TS for Plex/Jellyfin, while
+recording each stream to the library.
 
-One process per channel. The browser is the distro Chromium driven over the
-DevTools protocol (CDP) - no Playwright, no pip dependencies; the only
-non-stdlib import is websocket (py3-websocket-client, apk).
-
-Detection is DOM-based (Phase 1) but isolated behind Capture.probe_live() so
-it can be swapped for an MTProto detector without touching the join, encode
-or harvest logic.
+Telegram RTMP broadcasts are delivered as ~1s standalone-MP4 chunks over
+MTProto (join the call for presence, then upload.getFile the chunks). Each
+chunk is remuxed (-c copy, no re-encode) to an MPEG-TS HLS segment on a
+gapless timeline. Detection, join, download and recording are all API calls -
+no Chromium, no Xvfb, no MediaMTX.
 """
 
-import base64
+import asyncio
 import datetime
 import html
 import json
 import os
 import re
-import shlex
-import signal
+import struct
 import subprocess
 import threading
 import time
-import urllib.parse
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import websocket
+from telethon import TelegramClient, functions, types
+from telethon.errors import RPCError, SessionPasswordNeededError
 
 
 def env(name, default=None, required=False):
-    value = os.environ.get(name, "")
-    if not value:
+    v = os.environ.get(name, "")
+    if not v:
         if required:
             raise SystemExit(f"CRITICAL ERROR: {name} is required")
         return default
-    return value
+    return v
 
 
 CFG = {
@@ -43,38 +40,29 @@ CFG = {
     "peer": env("TG_PEER", required=True),
     "name": env("TG_NAME") or env("TG_SLUG", required=True),
     "channel_number": int(env("TG_CHANNEL_NUMBER", "1")),
-    "width": int(env("CAPTURE_WIDTH", "1920")),
-    "height": int(env("CAPTURE_HEIGHT", "1080")),
-    "fps": int(env("CAPTURE_FPS", "30")),
-    "bitrate": env("CAPTURE_BITRATE", "4500k"),
-    "encoder": env("CAPTURE_ENCODER", "cpu"),
-    "vaapi_device": env("VAAPI_DEVICE", "/dev/dri/renderD128"),
-    # Residual constant A/V offset in seconds; positive delays audio.
-    "audio_offset": float(env("AUDIO_OFFSET", "0")),
+    "api_id": int(env("API_ID", required=True)),
+    "api_hash": env("API_HASH", required=True),
     "record": env("RECORD", "true").lower() == "true",
-    "poll_interval": float(env("POLL_INTERVAL", "5")),
-    "end_grace": float(env("END_GRACE", "45")),
-    "join_timeout": float(env("JOIN_TIMEOUT", "45")),
-    "rtmp_url": env("RTMP_URL", "rtmp://mediamtx:1935"),
     "public_host": env("PUBLIC_HOST", "localhost"),
-    "hls_port": int(env("HLS_PORT", "8888")),
     "http_port": int(env("HTTP_PORT", "8409")),
-    # Host-published port for the /login URL printed in the log, when the
-    # compose mapping differs from HTTP_PORT (e.g. "8410:8409").
     "public_http_port": int(env("PUBLIC_HTTP_PORT", env("HTTP_PORT", "8409"))),
-    "display": env("DISPLAY", ":99"),
-    "cdp_port": int(env("CDP_PORT", "9222")),
-    "segment_seconds": int(env("RECORD_SEGMENT_SECONDS", "600")),
-    "segments_dir": env("SEGMENTS_DIR", "/segments"),
-    "library_dir": env("LIBRARY_DIR", "/library"),
+    "poll_interval": float(env("POLL_INTERVAL", "5")),
+    "buffer_ms": int(env("BUFFER_MS", "2000")),
+    "window": int(env("HLS_WINDOW", "12")),
+    "grace": int(env("HLS_GRACE", "8")),
+    "video_quality": int(env("VIDEO_QUALITY", "2")),
     "state_dir": env("STATE_DIR", "/state"),
+    "library_dir": env("LIBRARY_DIR", "/library"),
+    "run_dir": env("RUN_DIR", "/run/tgstream"),
 }
 
 PATH = f"tg-{CFG['slug']}"
-STREAM_URL = f"http://{CFG['public_host']}:{CFG['hls_port']}/{PATH}/index.m3u8"
-PUBLISH_URL = f"{CFG['rtmp_url']}/{PATH}"
-
+HLS_DIR = os.path.join(CFG["run_dir"], "hls")
+REC_DIR = os.path.join(CFG["run_dir"], "rec")
+STREAM_URL = (f"http://{CFG['public_host']}:{CFG['public_http_port']}"
+              f"/stream.m3u8")
 XMLTV_FMT = "%Y%m%d%H%M%S %z"
+JOIN_SSRC = 0x50000000
 
 
 def log(msg):
@@ -83,355 +71,38 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------
-# FRAGILE: Telegram Web K selectors and visible-text probes.
+# Minimal MP4 parser: audio-track content duration (seconds).
 #
-# Everything that depends on Telegram Web's DOM lives between these markers.
-# When Telegram renames things, refresh this block only: run the container
-# with DEBUG_VNC=true, start a group call in a throwaway channel you own, and
-# inspect the live bar. Russian strings included because the account's UI
-# language is likely Russian. Video handling below is deliberately
-# selector-free and should NOT need updates.
+# Telegram chunks carry ~1003ms of audio (47 AAC frames) but 1000ms of video.
+# Advancing the output timeline by the AUDIO duration keeps audio perfectly
+# gapless and A/V synced (shared offset), leaving only an imperceptible ~3ms
+# video micro-gap. The audio track's mdhd has timescale 48000.
 # ---------------------------------------------------------------------------
 
-LIVE_BAR_SELECTORS = [
-    # RTMP live streams (verified 2026-08 against a real broadcast): bar text
-    # "Live Stream / N watching / Join", join button below.
-    ".pinned-container.pinned-live",
-    # Video chats / group calls (K can join these but renders audio only).
-    ".pinned-container.pinned-group-call",
-    ".pinned-container.pinned-call",
-]
-
-# The explicit Join control inside the live bar, when present.
-LIVE_JOIN_BUTTON = ".pinned-live-action-button"
-
-LIVE_TEXT_MARKERS = [
-    "live stream",
-    "video chat",
-    "voice chat",
-    "прямой эфир",
-    "трансляция",
-    "голосовой чат",
-    "видеочат",
-]
-
-JOIN_BUTTON_TEXTS = [
-    "join",
-    "watch",
-    "присоединиться",
-    "смотреть",
-]
-
-# Telegram Web K keeps the MTProto session under this localStorage key; its
-# presence is the authorization signal for the integrated QR login.
-AUTH_PROBE_JS = """
-(() => {
-    try {
-        return { authorized: !!localStorage.getItem('user_auth') };
-    } catch (e) {
-        return { authorized: false };
-    }
-})()
-"""
-
-# 2FA: after a QR scan, accounts with a cloud password get a password form.
-PASSWORD_PRESENT_JS = """
-(() => {
-    for (const el of document.querySelectorAll('input[type="password"]')) {
-        const r = el.getBoundingClientRect();
-        if (r.width > 5 && r.height > 5) return true;
-    }
-    return false;
-})()
-"""
-
-SUBMIT_PASSWORD_JS = """
-((pw) => {
-    let input = null;
-    for (const el of document.querySelectorAll('input[type="password"]')) {
-        const r = el.getBoundingClientRect();
-        if (r.width > 5 && r.height > 5) { input = el; break; }
-    }
-    if (!input) return false;
-    const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype, 'value').set;
-    setter.call(input, pw);
-    input.dispatchEvent(new Event('input', {bubbles: true}));
-    // Prefer a visible submit button; fall back to Enter on the input.
-    let clicked = false;
-    for (const b of document.querySelectorAll('button')) {
-        const r = b.getBoundingClientRect();
-        if (r.width < 5 || r.height < 5) continue;
-        const t = (b.innerText || '').trim().toLowerCase();
-        if (t && t.length < 30) { b.click(); clicked = true; break; }
-    }
-    if (!clicked) {
-        input.dispatchEvent(new KeyboardEvent('keydown',
-            {key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true}));
-    }
-    return true;
-})(__PASSWORD__)
-"""
-
-# Probe the active chat's top area for a visible live-stream bar. Selector
-# hits win; otherwise fall back to scanning visible text for the markers.
-# Marks the found element with data-tgstream-live so join() can click it.
-PROBE_JS = """
-(() => {
-    const selectors = __SELECTORS__;
-    const markers = __MARKERS__;
-    // Scan only the active chat column: the sidebar previews service
-    // messages ("Live Stream started") that must not trigger detection.
-    const scope = document.querySelector('#column-center') || document.body;
-    const visible = (el) => {
-        const r = el.getBoundingClientRect();
-        if (r.width < 10 || r.height < 10) return false;
-        const s = window.getComputedStyle(el);
-        return s.display !== 'none' && s.visibility !== 'hidden';
-    };
-    const mark = (el, title) => {
-        document.querySelectorAll('[data-tgstream-live]')
-            .forEach(e => e.removeAttribute('data-tgstream-live'));
-        el.setAttribute('data-tgstream-live', '1');
-        return { live: true, title: title || '' };
-    };
-    for (const sel of selectors) {
-        try {
-            for (const el of scope.querySelectorAll(sel)) {
-                if (visible(el)) return mark(el, el.innerText.split('\\n')[0]);
-            }
-        } catch (e) { /* bad selector after UI churn - fall through */ }
-    }
-    // Text fallback: any visible element near the top of the chat column
-    // whose own text matches a live marker.
-    const lower = markers.map(m => m.toLowerCase());
-    const all = scope.querySelectorAll('div,section,button,span');
-    for (const el of all) {
-        const r = el.getBoundingClientRect();
-        if (r.top > 250 || !visible(el)) continue;
-        const text = (el.innerText || '').trim().toLowerCase();
-        if (!text || text.length > 120) continue;
-        if (lower.some(m => text.includes(m))) {
-            // Prefer a clickable ancestor if the match is a bare label.
-            let target = el;
-            for (let up = el; up && up !== scope; up = up.parentElement) {
-                const cls = up.className || '';
-                if (typeof cls === 'string' &&
-                    (cls.includes('pinned') || up.tagName === 'BUTTON')) {
-                    target = up;
-                    break;
-                }
-            }
-            return mark(target, el.innerText.split('\\n').pop());
-        }
-    }
-    return { live: false, title: '' };
-})()
-""".replace("__SELECTORS__", json.dumps(LIVE_BAR_SELECTORS)) \
-   .replace("__MARKERS__", json.dumps(LIVE_TEXT_MARKERS))
-
-CLICK_LIVE_BAR_JS = """
-(() => {
-    // Prefer the live bar's explicit Join control. Never blind-click an
-    // in-call bar (pinned-call) - that area holds mic/leave buttons.
-    const btn = document.querySelector('__JOIN_BUTTON__');
-    if (btn && btn.getBoundingClientRect().width > 0) {
-        btn.click();
-        return 'join';
-    }
-    const el = document.querySelector('[data-tgstream-live]');
-    if (el && !(el.className || '').toString().includes('pinned-call')) {
-        el.click();
-        return 'bar';
-    }
-    return 'already joined';
-})()
-""".replace("__JOIN_BUTTON__", LIVE_JOIN_BUTTON)
-
-# After joining an RTMP stream the in-call bar appears but the stream player
-# (and its <video>) only materializes when the bar is clicked open. The click
-# TOGGLES the player, so it must never fire while the player exists (even
-# one still loading) - the guard checks for player videos, not readiness.
-OPEN_PLAYER_JS = """
-(() => {
-    // Only the player's own video (media-video class) proves the player is
-    // open - the live bar carries a circular preview video that must not
-    // satisfy this check.
-    if (document.querySelector('video.media-video'))
-        return 'player present';
-    const c = document.querySelector('.topbar-call-center');
-    if (!c) return 'no call bar';
-    c.click();
-    return 'clicked';
-})()
-"""
-
-# A previous failed attempt can leave the account joined to the call
-# server-side; K re-attaches on boot and shows a stuck "Connecting..." bar,
-# and never auto-opens the player for a re-attached call. Leave it first.
-LEAVE_STUCK_CALL_JS = """
-(() => {
-    const bar = document.querySelector('.pinned-call');
-    if (!bar || bar.getBoundingClientRect().width === 0) return 'no call';
-    const btn = bar.querySelector('.topbar-call-end-btn');
-    if (!btn) return 'no leave button';
-    btn.click();
-    return 'left';
-})()
-"""
-
-# Confirm buttons inside popups only ("Join"/"Watch" dialogs) - a global
-# button sweep re-clicks the live bar's own Join and toggles the call.
-CLICK_JOIN_JS = """
-(() => {
-    const texts = __TEXTS__;
-    const lower = texts.map(t => t.toLowerCase());
-    const candidates = document.querySelectorAll(
-        '.popup button, .popup .btn-primary');
-    for (const el of candidates) {
-        const r = el.getBoundingClientRect();
-        if (r.width < 5 || r.height < 5) continue;
-        const text = (el.innerText || '').trim().toLowerCase();
-        if (text && text.length < 40 && lower.some(t => text.includes(t))) {
-            el.click();
-            return text;
-        }
-    }
-    return null;
-})()
-""".replace("__TEXTS__", json.dumps(JOIN_BUTTON_TEXTS))
-
-# ---------------------------------------------------------------------------
-# End of the fragile selector block.
-# ---------------------------------------------------------------------------
-
-# QR login mirroring. The login QR is a square-ish canvas (the biggest canvas
-# on the page is the doodle wallpaper, hence the aspect-ratio filter) with a
-# transparent background (composited onto white or it decodes as black).
-# jsQR is vendored next to this file and injected on demand, because SPA
-# navigations recreate the JS context and drop injected globals.
-
-with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "jsQR.js")) as _f:
-    JSQR_SRC = _f.read()
-
-QR_MIRROR_JS = """
-(() => {
-    if (typeof jsQR === 'undefined') return {err: 'jsqr missing'};
-    const all = [...document.querySelectorAll('canvas')]
-        .filter(c => c.width > 50);
-    if (!all.length) return {err: 'no canvas'};
-    const squarish = all.filter(c => {
-        const ratio = c.width / c.height;
-        return ratio > 0.8 && ratio < 1.25;
-    }).sort((a, b) => b.width * b.height - a.width * a.height);
-    if (!squarish.length) return {err: 'no square canvas'};
-    for (const c of squarish) {
-        const off = document.createElement('canvas');
-        off.width = c.width; off.height = c.height;
-        const ctx = off.getContext('2d', {willReadFrequently: true});
-        ctx.fillStyle = '#fff';
-        ctx.fillRect(0, 0, off.width, off.height);
-        ctx.drawImage(c, 0, 0);
-        const d = ctx.getImageData(0, 0, off.width, off.height);
-        const r = jsQR(d.data, d.width, d.height,
-                       {inversionAttempts: 'attemptBoth'});
-        if (r && r.data) {
-            return {data: r.data, png: off.toDataURL('image/png')};
-        }
-    }
-    return {err: 'decode failed'};
-})()
-"""
-
-# Selector-free video handling: pick the best loaded <video>, reparent it
-# into a full-viewport stage and start playback. K's stream player opens
-# PAUSED (readyState 4, paused:true), so paused videos count. Scoring:
-# the player's main video carries the media-video class; square videos are
-# circular participant/preview thumbnails and must lose to the real stream.
-# Idempotent and re-entrant: called every live tick, so when the main video
-# loads late it evicts a provisionally staged thumbnail.
-STAGE_VIDEO_JS = """
-(() => {
-    const loaded = [...document.querySelectorAll('video')].filter(v => {
-        return v.readyState >= 2 && v.videoWidth > 0;
-    });
-    if (!loaded.length) return false;
-    const main = loaded.filter(v =>
-        (v.className || '').toString().includes('media-video'));
-    let pool;
-    if (main.length) {
-        pool = main;
-    } else if (document.querySelector('.pinned-call.is-rtmp') ||
-               document.querySelector('.pinned-live')) {
-        // RTMP stream: without the player's media-video, the only loaded
-        // videos are circular bar previews - wait for the real player.
-        return false;
-    } else {
-        pool = loaded;  // video chats have no media-video; take what exists
-    }
-    const score = (v) => {
-        let s = v.videoWidth * v.videoHeight;
-        if (v.videoWidth === v.videoHeight) s -= 50000000;
-        return s;
-    };
-    pool.sort((a, b) => score(b) - score(a));
-    const v = pool[0];
-    let stage = document.getElementById('tgstream-stage');
-    if (!stage) {
-        stage = document.createElement('div');
-        stage.id = 'tgstream-stage';
-        stage.style.cssText =
-            'position:fixed;inset:0;background:#000;z-index:2147483647;' +
-            'display:flex;align-items:center;justify-content:center;cursor:none;';
-        document.body.appendChild(stage);
-    }
-    if (v.parentElement !== stage) {
-        // Evict a previously staged (lesser) video; keep it alive but hidden.
-        for (const old of [...stage.children]) {
-            old.style.cssText = 'display:none;';
-            document.body.appendChild(old);
-        }
-        stage.appendChild(v);
-    }
-    v.style.cssText = 'width:100vw;height:100vh;object-fit:contain;cursor:none;';
-    v.muted = false;
-    v.volume = 1.0;
-    v.controls = false;
-    // Telegram live streams are rewindable and the player opens at the
-    // buffer position, not the live edge - which can be hours behind.
-    // Seek ONCE per staged element (dataset flag): re-seeking every tick
-    // never lets the player finish rebuffering at the new position.
-    let seeked = false;
-    try {
-        if (!v.dataset.tgstreamSeeked && v.seekable && v.seekable.length) {
-            const edge = v.seekable.end(v.seekable.length - 1);
-            if (edge - v.currentTime > 15) {
-                v.currentTime = Math.max(0, edge - 2);
-                seeked = true;
-            }
-            v.dataset.tgstreamSeeked = '1';
-        }
-    } catch (e) {}
-    v.play().catch(() => {});
-    return seeked ? 'seeked' : true;
-})()
-"""
-
-UNSTAGE_JS = """
-(() => {
-    const stage = document.getElementById('tgstream-stage');
-    if (stage) stage.remove();
-})()
-"""
-
-VIDEO_CLOCK_JS = """
-(() => {
-    const v = document.querySelector('#tgstream-stage video');
-    if (!v) return null;
-    return { t: v.currentTime, ended: v.ended, paused: v.paused };
-})()
-"""
+def audio_duration(mp4: bytes) -> float:
+    best = None
+    i = 0
+    n = len(mp4)
+    # Scan for every 'mdhd' box and read its timescale/duration; the audio
+    # track is the one with timescale == the audio sample rate (48000).
+    while True:
+        j = mp4.find(b"mdhd", i)
+        if j < 0:
+            break
+        i = j + 4
+        try:
+            ver = mp4[j + 4]
+            if ver == 1:
+                ts = struct.unpack(">I", mp4[j + 4 + 20:j + 4 + 24])[0]
+                dur = struct.unpack(">Q", mp4[j + 4 + 24:j + 4 + 32])[0]
+            else:
+                ts = struct.unpack(">I", mp4[j + 4 + 12:j + 4 + 16])[0]
+                dur = struct.unpack(">I", mp4[j + 4 + 16:j + 4 + 20])[0]
+            if ts in (48000, 44100, 24000, 16000) and dur:
+                best = dur / ts
+        except (struct.error, IndexError):
+            continue
+    return best if best else 1.0
 
 
 def sanitize_title(title):
@@ -439,42 +110,21 @@ def sanitize_title(title):
     return title[:120] or "Stream"
 
 
-class State:
-    """Shared status, read by the HTTP server, written by the capture loop."""
+# ---------------------------------------------------------------------------
+# Shared state (HTTP reads it, the capture loop writes it)
+# ---------------------------------------------------------------------------
 
+class State:
     def __init__(self):
         self.lock = threading.Lock()
-        self.state = "starting"
+        self.state = "starting"     # starting|needs-login|idle|live
         self.title = None
         self.since = None
         self.last_error = None
-        # Integrated QR login: written by the capture loop, read by HTTP;
-        # pending_password flows the other way (POST /login/password).
         self.qr_png = None
         self.qr_token = None
         self.password_needed = False
         self.pending_password = None
-
-    def set_qr(self, token, png):
-        """Store the current QR; True if the token changed."""
-        with self.lock:
-            changed = token != self.qr_token
-            self.qr_token = token
-            self.qr_png = png
-            return changed
-
-    def clear_login(self):
-        with self.lock:
-            self.qr_png = None
-            self.qr_token = None
-            self.password_needed = False
-            self.pending_password = None
-
-    def take_password(self):
-        with self.lock:
-            pw = self.pending_password
-            self.pending_password = None
-            return pw
 
     def set(self, state=None, title=None, error=None):
         with self.lock:
@@ -491,16 +141,12 @@ class State:
     def snapshot(self):
         with self.lock:
             return {
-                "slug": CFG["slug"],
-                "name": CFG["name"],
-                "path": PATH,
-                "channel_number": CFG["channel_number"],
-                "state": self.state,
+                "slug": CFG["slug"], "name": CFG["name"], "path": PATH,
+                "channel_number": CFG["channel_number"], "state": self.state,
                 "title": self.title,
                 "since": self.since.isoformat() if self.since else None,
                 "since_ts": self.since.timestamp() if self.since else None,
-                "url": STREAM_URL,
-                "record": CFG["record"],
+                "url": STREAM_URL, "record": CFG["record"],
                 "last_error": self.last_error,
             }
 
@@ -509,310 +155,186 @@ STATE = State()
 
 
 # ---------------------------------------------------------------------------
-# Browser: distro Chromium driven over CDP
+# HLS: rolling playlist of MPEG-TS segments written by the streamer.
 # ---------------------------------------------------------------------------
 
-class BrowserError(Exception):
-    pass
-
-
-class Browser:
-    """Launches Chromium on the Xvfb display and talks CDP to its page.
-
-    The whole automation surface is three methods: navigate, reload and
-    evaluate. Every failure raises BrowserError; the caller relaunches.
-    """
+class Hls:
+    """Owns the segment directory and the live m3u8. Segments are written by
+    remux(); the playlist advertises a rolling WINDOW, files are kept GRACE
+    longer so a lagging player never 404s."""
 
     def __init__(self):
-        self.proc = None
-        self.ws = None
-        self.msg_id = 0
+        self.lock = threading.Lock()
+        self.idx = 0
+        self.seq = 0
+        self.segs = []          # (index, duration) in the playlist window
+        self.off = 0.0          # running timeline offset (seconds)
+        self.disc_pending = False
+        os.makedirs(HLS_DIR, exist_ok=True)
 
-    def launch(self, url):
-        profile = os.path.join(CFG["state_dir"], "profile")
-        # A lock left by a previous container carries a foreign hostname, and
-        # Chromium refuses profiles "in use on another computer" (exit 21).
-        # We are the profile's only user, so clearing it is always safe.
-        for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            try:
-                os.unlink(os.path.join(profile, lock))
-            except OSError:
-                pass
-        args = [
-            "chromium-browser",
-            f"--user-data-dir={profile}",
-            f"--remote-debugging-port={CFG['cdp_port']}",
-            f"--remote-allow-origins=http://127.0.0.1:{CFG['cdp_port']}",
-            "--kiosk",
-            f"--window-size={CFG['width']},{CFG['height']}",
-            "--window-position=0,0",
-            "--autoplay-policy=no-user-gesture-required",
-            "--no-first-run",
-            "--disable-infobars",
-            "--disable-session-crashed-bubble",
-            "--hide-crash-restore-bubble",
-            "--no-sandbox",
-            url,
-        ]
-        log(f"Launching browser: {url}")
-        self.proc = subprocess.Popen(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self._connect()
+    def reset_offset(self):
+        # Called on (re)join / slate<->live transitions: next segment carries
+        # an EXT-X-DISCONTINUITY so players re-baseline their clock.
+        self.disc_pending = True
 
-    def _connect(self):
-        base = f"http://127.0.0.1:{CFG['cdp_port']}"
-        deadline = time.monotonic() + 60
-        targets = None
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                raise BrowserError(
-                    f"chromium exited with code {self.proc.returncode}")
-            try:
-                with urllib.request.urlopen(f"{base}/json", timeout=5) as resp:
-                    targets = json.load(resp)
-                break
-            except OSError:
-                time.sleep(1)
-        if targets is None:
-            raise BrowserError("CDP endpoint never came up")
-        pages = [t for t in targets if t.get("type") == "page"]
-        if not pages:
-            raise BrowserError("no page target in CDP target list")
-        # Chrome 111+ rejects CDP connections with a foreign Origin header;
-        # send none (suppress_origin) and allow the local one via the
-        # --remote-allow-origins flag as a fallback.
-        self.ws = websocket.create_connection(
-            pages[0]["webSocketDebuggerUrl"], timeout=30,
-            suppress_origin=True)
-
-    def cmd(self, method, params=None, timeout=30):
-        if self.ws is None:
-            raise BrowserError("not connected")
-        self.msg_id += 1
-        try:
-            self.ws.send(json.dumps(
-                {"id": self.msg_id, "method": method, "params": params or {}}))
-            deadline = time.monotonic() + timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise BrowserError(f"{method} timed out")
-                self.ws.settimeout(remaining)
-                msg = json.loads(self.ws.recv())
-                # CDP interleaves async events with responses; match by id.
-                if msg.get("id") == self.msg_id:
-                    if "error" in msg:
-                        raise BrowserError(f"{method}: {msg['error']}")
-                    return msg.get("result", {})
-        except (websocket.WebSocketException, OSError, ValueError) as exc:
-            raise BrowserError(f"{method}: {exc}") from exc
-
-    def evaluate(self, expression):
-        result = self.cmd("Runtime.evaluate", {
-            "expression": expression, "returnByValue": True})
-        if "exceptionDetails" in result:
-            detail = result["exceptionDetails"].get("text", "JS exception")
-            raise BrowserError(f"evaluate: {detail}")
-        return result.get("result", {}).get("value")
-
-    def navigate(self, url):
-        self.cmd("Page.navigate", {"url": url})
-
-    def reload(self):
-        self.cmd("Page.reload", {})
-
-    def close(self):
-        if self.ws is not None:
-            try:
-                self.ws.close()
-            except (websocket.WebSocketException, OSError):
-                pass
-            self.ws = None
-        if self.proc is not None:
-            if self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-                    self.proc.wait()
-            self.proc = None
-
-
-# ---------------------------------------------------------------------------
-# ffmpeg supervisor
-# ---------------------------------------------------------------------------
-
-class Ffmpeg:
-    """Runs exactly one publisher (slate or live) on the channel's RTMP path.
-
-    ensure() is called every tick from the main loop: it restarts a dead
-    process in its current mode and switches modes by stopping and starting.
-    """
-
-    def __init__(self):
-        self.proc = None
-        self.mode = None
-
-    def command(self, mode):
-        if mode == "slate":
-            return [
-                "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                "-re", "-stream_loop", "-1",
-                "-i", os.path.join(CFG["state_dir"], "slate.ts"),
-                "-c", "copy",
-                "-f", "flv", PUBLISH_URL,
-            ]
-        # A/V sync: thread_queue_size stops input-queue starvation under
-        # encoder load (a classic drift source); small pulse fragments cut
-        # audio buffering latency; aresample=async=1 absorbs residual drift.
-        # Do NOT wallclock-stamp the pulse input - its packet read times are
-        # jittery and async resampling then pads the jitter with silence.
-        # AUDIO_OFFSET shifts audio for any remaining constant offset.
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-thread_queue_size", "1024",
-            "-f", "x11grab",
-            "-framerate", str(CFG["fps"]),
-            "-video_size", f"{CFG['width']}x{CFG['height']}",
-            "-draw_mouse", "0",
-            "-i", CFG["display"],
-            "-thread_queue_size", "1024",
-        ]
-        if CFG["audio_offset"] != 0.0:
-            cmd += ["-itsoffset", str(CFG["audio_offset"])]
-        cmd += [
-            "-f", "pulse", "-fragment_size", "4096", "-i", "tgcap.monitor",
-        ]
-        gop = str(CFG["fps"] * 2)
-        if CFG["encoder"] == "vaapi":
-            cmd += [
-                "-vaapi_device", CFG["vaapi_device"],
-                "-vf", "format=nv12,hwupload",
-                "-c:v", "h264_vaapi",
-                # No B-frames: they reorder DTS in ways RTMP/FLV consumers
-                # (MediaMTX readers, recorder) reject as non-monotonic.
-                "-bf", "0",
-                "-b:v", CFG["bitrate"], "-maxrate", CFG["bitrate"],
-                "-g", gop,
-            ]
-        elif CFG["encoder"] == "v4l2m2m":
-            # Raspberry Pi 4 hardware encoder (Pi 5 has no H.264 encoder).
-            cmd += [
-                "-pix_fmt", "yuv420p",
-                "-c:v", "h264_v4l2m2m",
-                "-b:v", CFG["bitrate"],
-                "-g", gop,
-            ]
-        else:
-            cmd += [
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-profile:v", "high", "-pix_fmt", "yuv420p",
-                "-b:v", CFG["bitrate"], "-maxrate", CFG["bitrate"],
-                "-bufsize", "2M",
-                "-g", gop,
-            ]
-        cmd += [
-            # min_hard_comp keeps async correction to rare hard jumps -
-            # continuous micro-adjustment creates backward DTS steps that
-            # make MediaMTX drop readers/recorder.
-            "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
-            "-f", "flv", PUBLISH_URL,
-        ]
-        return cmd
-
-    def ensure(self, mode):
-        if self.proc is not None and self.proc.poll() is not None:
-            log(f"ffmpeg ({self.mode}) died with code {self.proc.returncode}, restarting")
-            self.proc = None
-        if self.proc is not None and self.mode == mode:
-            return
-        self.stop()
-        cmd = self.command(mode)
-        log(f"Starting ffmpeg ({mode}): {shlex.join(cmd)}")
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
-        self.mode = mode
-
-    def stop(self):
-        if self.proc is None:
-            return
-        if self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
-        self.proc = None
-        self.mode = None
-
-
-# ---------------------------------------------------------------------------
-# Harvest: concatenate MediaMTX segments overlapping the live window
-# ---------------------------------------------------------------------------
-
-SEGMENT_RE = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})-\d+\.ts$")
-
-
-def harvest(title, start_ts, end_ts):
-    """Copy-concatenate the recording segments covering [start_ts, end_ts]
-    into the library. Runs in a background thread; must not touch STATE
-    machine internals beyond last_error."""
-    try:
-        seg_dir = os.path.join(CFG["segments_dir"], PATH)
-        if not os.path.isdir(seg_dir):
-            raise RuntimeError(f"segment directory {seg_dir} does not exist")
-
-        margin = 15
-        seg_len = CFG["segment_seconds"]
-        chosen = []
-        for fname in sorted(os.listdir(seg_dir)):
-            m = SEGMENT_RE.match(fname)
-            if not m:
-                continue
-            # Segment timestamps are local time (must share TZ with MediaMTX).
-            seg_start = datetime.datetime(
-                *(int(g) for g in m.groups())).timestamp()
-            if seg_start < end_ts + margin and seg_start + seg_len > start_ts - margin:
-                chosen.append(os.path.join(seg_dir, fname))
-        if not chosen:
-            raise RuntimeError("no recording segments overlap the live window")
-
-        date = datetime.datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d")
-        out_dir = os.path.join(CFG["library_dir"], CFG["name"])
-        os.makedirs(out_dir, exist_ok=True)
-        base = f"{CFG['name']} - {date} - {sanitize_title(title)}"
-        out = os.path.join(out_dir, f"{base}.mp4")
-        n = 2
-        while os.path.exists(out):
-            out = os.path.join(out_dir, f"{base} ({n}).mp4")
-            n += 1
-
-        concat_list = os.path.join(
-            CFG["state_dir"], f"harvest-concat-{int(start_ts)}.txt")
-        with open(concat_list, "w") as f:
-            for path in chosen:
-                escaped = path.replace("'", "'\\''")
-                f.write(f"file '{escaped}'\n")
-
-        log(f"Harvesting {len(chosen)} segments -> {out}")
-        tmp = out + ".part"
+    def add(self, mp4_bytes, record_writer=None):
+        """Remux one chunk to a segment, publish it, return its duration."""
+        idx = self.idx
+        out_ts = os.path.join(HLS_DIR, f"s{idx}.ts")
+        part = out_ts + ".part"
+        dur = audio_duration(mp4_bytes)
+        tmp_mp4 = os.path.join(HLS_DIR, "cur.mp4")
+        with open(tmp_mp4, "wb") as f:
+            f.write(mp4_bytes)
+        # -c copy both streams, shift onto the running gapless timeline.
         subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-             "-f", "concat", "-safe", "0", "-i", concat_list,
-             "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp],
-            check=True)
-        os.rename(tmp, out)
-        os.unlink(concat_list)
-        log(f"Harvest complete: {out}")
-    except Exception as exc:  # noqa: BLE001 - report, never crash the capture
-        STATE.set(error=f"harvest failed: {exc}")
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-i", tmp_mp4, "-c", "copy", "-muxdelay", "0", "-muxpreload", "0",
+             "-output_ts_offset", f"{self.off:.3f}", "-f", "mpegts", part],
+            check=False)
+        try:
+            os.replace(part, out_ts)
+        except OSError:
+            return dur
+        if record_writer is not None:
+            record_writer(out_ts)
+        with self.lock:
+            disc = self.disc_pending
+            self.disc_pending = False
+            self.segs.append((idx, dur, disc))
+            if len(self.segs) > CFG["window"]:
+                self.segs.pop(0)
+                self.seq += 1
+            self._write_playlist()
+            self.off += dur
+            self.idx += 1
+        old = os.path.join(HLS_DIR, f"s{idx - CFG['window'] - CFG['grace']}.ts")
+        if os.path.exists(old):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        return dur
+
+    def _write_playlist(self):
+        target = max((int(d) + 1 for _, d, _ in self.segs), default=1)
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+                 f"#EXT-X-TARGETDURATION:{target}",
+                 f"#EXT-X-MEDIA-SEQUENCE:{self.seq}"]
+        for i, d, disc in self.segs:
+            if disc:
+                lines.append("#EXT-X-DISCONTINUITY")
+            lines.append(f"#EXTINF:{d:.3f},")
+            lines.append(f"s{i}.ts")
+        tmp = os.path.join(HLS_DIR, "index.m3u8.tmp")
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, os.path.join(HLS_DIR, "index.m3u8"))
+
+    def playlist_bytes(self):
+        p = os.path.join(HLS_DIR, "index.m3u8")
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def segment_path(self, name):
+        if not re.fullmatch(r"s\d+\.ts", name):
+            return None
+        return os.path.join(HLS_DIR, name)
+
+    def latest_index(self):
+        with self.lock:
+            return self.idx
+
+
+HLS = Hls()
 
 
 # ---------------------------------------------------------------------------
-# HTTP endpoints (stdlib, no framework)
+# Recording: archive live segments, concat to mp4 on stream end.
+# ---------------------------------------------------------------------------
+
+class Recorder:
+    def __init__(self):
+        self.active = False
+        self.files = []
+        self.title = None
+        self.start_ts = None
+
+    def begin(self, title):
+        if not CFG["record"]:
+            return
+        os.makedirs(REC_DIR, exist_ok=True)
+        self.active = True
+        self.files = []
+        self.title = title or CFG["name"]
+        self.start_ts = time.time()
+        log(f"Recording started: {self.title}")
+
+    def add(self, ts_path):
+        if not self.active:
+            return
+        dst = os.path.join(REC_DIR, f"r{len(self.files)}.ts")
+        try:
+            with open(ts_path, "rb") as s, open(dst, "wb") as d:
+                d.write(s.read())
+            self.files.append(dst)
+        except OSError as exc:
+            STATE.set(error=f"record copy failed: {exc}")
+
+    def finish(self):
+        if not self.active:
+            return
+        self.active = False
+        files = self.files
+        self.files = []
+        if not files:
+            return
+        threading.Thread(target=self._harvest,
+                         args=(self.title, self.start_ts, files),
+                         daemon=True).start()
+
+    def _harvest(self, title, start_ts, files):
+        try:
+            date = datetime.datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d")
+            out_dir = os.path.join(CFG["library_dir"], CFG["name"])
+            os.makedirs(out_dir, exist_ok=True)
+            base = f"{CFG['name']} - {date} - {sanitize_title(title)}"
+            out = os.path.join(out_dir, f"{base}.mp4")
+            n = 2
+            while os.path.exists(out):
+                out = os.path.join(out_dir, f"{base} ({n}).mp4")
+                n += 1
+            listf = os.path.join(REC_DIR, "concat.txt")
+            with open(listf, "w") as f:
+                for p in files:
+                    f.write(f"file '{p}'\n")
+            tmp = out + ".part"
+            log(f"Harvesting {len(files)} segments -> {out}")
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-f", "concat", "-safe", "0", "-i", listf,
+                 "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp],
+                check=True)
+            os.replace(tmp, out)
+            log(f"Harvest complete: {out}")
+        except Exception as exc:  # noqa: BLE001
+            STATE.set(error=f"harvest failed: {exc}")
+        finally:
+            for p in files:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+REC = Recorder()
+
+
+# ---------------------------------------------------------------------------
+# HTTP endpoints
 # ---------------------------------------------------------------------------
 
 def render_playlist():
@@ -821,9 +343,7 @@ def render_playlist():
         "#EXTM3U",
         (f'#EXTINF:-1 tvg-id="{s["slug"]}" tvg-name="{s["name"]}" '
          f'tvg-chno="{s["channel_number"]}" group-title="Telegram",{s["name"]}'),
-        s["url"],
-        "",
-    ])
+        s["url"], ""])
 
 
 def render_epg():
@@ -831,27 +351,26 @@ def render_epg():
     now = datetime.datetime.now(datetime.timezone.utc).replace(
         minute=0, second=0, microsecond=0)
     out = ['<?xml version="1.0" encoding="UTF-8"?>',
-           '<tv generator-info-name="tgstream">']
-    out.append(f'  <channel id="{s["slug"]}">')
-    out.append(f'    <display-name>{html.escape(s["name"])}</display-name>')
-    out.append('  </channel>')
+           '<tv generator-info-name="tgstream">',
+           f'  <channel id="{s["slug"]}">',
+           f'    <display-name>{html.escape(s["name"])}</display-name>',
+           '  </channel>']
 
-    def programme(start, stop, title):
-        out.append(f'  <programme start="{start.strftime(XMLTV_FMT)}" '
-                   f'stop="{stop.strftime(XMLTV_FMT)}" channel="{s["slug"]}">')
+    def prog(a, b, title):
+        out.append(f'  <programme start="{a.strftime(XMLTV_FMT)}" '
+                   f'stop="{b.strftime(XMLTV_FMT)}" channel="{s["slug"]}">')
         out.append(f'    <title>{html.escape(title)}</title>')
         out.append('  </programme>')
 
-    if s["state"] == "live":
+    if s["state"] == "live" and s["since"]:
         since = datetime.datetime.fromisoformat(s["since"])
-        programme(since, now + datetime.timedelta(hours=4),
-                  s["title"] or f"{s['name']} live")
+        prog(since, now + datetime.timedelta(hours=4),
+             s["title"] or f"{s['name']} live")
     else:
-        # Plex refuses channels without guide data, so fill with hour blocks.
         for i in range(12):
-            programme(now + datetime.timedelta(hours=i),
-                      now + datetime.timedelta(hours=i + 1),
-                      f"{s['name']} (no stream)")
+            prog(now + datetime.timedelta(hours=i),
+                 now + datetime.timedelta(hours=i + 1),
+                 f"{s['name']} (no stream)")
     out.append('</tv>')
     return "\n".join(out)
 
@@ -859,40 +378,23 @@ def render_epg():
 def render_login_page():
     s = STATE.snapshot()
     if s["state"] != "needs-login":
-        body = ("<p>✓ Logged in — nothing to do here.</p>"
-                f"<p>Channel state: <b>{html.escape(s['state'])}</b></p>")
-        refresh = 30
-    else:
-        with STATE.lock:
-            password_needed = STATE.password_needed
-            token = STATE.qr_token
-        if password_needed:
-            body = (
-                "<p>QR scanned. This account has a cloud password (2FA) — "
-                "enter it to finish:</p>"
+        return ("<p>✓ Logged in.</p>"
+                f"<p>State: <b>{html.escape(s['state'])}</b></p>"), 30
+    with STATE.lock:
+        pw = STATE.password_needed
+        token = STATE.qr_token
+    if pw:
+        return ("<p>Two-factor password required:</p>"
                 '<form method="post" action="/login/password">'
-                '<input type="password" name="password" autofocus> '
-                '<button type="submit">Submit</button></form>')
-            refresh = 0
-        elif token:
-            body = (
-                "<p>Scan with the Telegram app: "
-                "<b>Settings &rarr; Devices &rarr; Link Desktop Device</b></p>"
-                '<p><img src="/qr.png" width="300" height="300" '
-                'style="image-rendering:pixelated"></p>'
-                f"<p>Can't scan? Open this on the phone: "
-                f"<code>{html.escape(token)}</code></p>"
-                "<p>The code rotates every ~30 seconds; this page follows.</p>")
-            refresh = 2
-        else:
-            body = "<p>Waiting for Telegram Web to show the QR code…</p>"
-            refresh = 2
-    meta = (f'<meta http-equiv="refresh" content="{refresh}">'
-            if refresh else "")
-    return (f"<!doctype html><html><head><title>{html.escape(CFG['name'])}"
-            f" login</title>{meta}</head>"
-            f"<body style=\"font-family:sans-serif;max-width:40em;margin:2em auto\">"
-            f"<h2>tgstream: {html.escape(CFG['name'])}</h2>{body}</body></html>")
+                '<input type="password" name="password" autofocus>'
+                ' <button>Submit</button></form>'), 0
+    if token:
+        return ("<p>Scan with Telegram: <b>Settings &rarr; Devices &rarr; "
+                "Link Desktop Device</b></p>"
+                '<p><img src="/qr.png" width="300" height="300"'
+                ' style="image-rendering:pixelated"></p>'
+                f"<p><code>{html.escape(token)}</code></p>"), 3
+    return "<p>Waiting for QR…</p>", 2
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -901,10 +403,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path in ("/stream.m3u8", "/index.m3u8"):
+            pl = HLS.playlist_bytes()
+            if pl is None:
+                self.send_error(404)
+            else:
+                self._send(pl, "application/vnd.apple.mpegurl")
+            return
+        if path == "/stream.ts":
+            self._serve_continuous_ts()
+            return
+        if re.fullmatch(r"/s\d+\.ts", path):
+            seg = HLS.segment_path(path.lstrip("/"))
+            if seg and os.path.exists(seg):
+                with open(seg, "rb") as f:
+                    self._send(f.read(), "video/mp2t")
+            else:
+                self.send_error(404)
+            return
         if path == "/qr.png":
             with STATE.lock:
                 png = STATE.qr_png
@@ -914,337 +437,342 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(png, "image/png")
             return
         if path == "/login":
-            self._send(render_login_page().encode(), "text/html")
+            body, refresh = render_login_page()
+            meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+            page = (f"<!doctype html><title>{html.escape(CFG['name'])} login"
+                    f"</title>{meta}<body style='font-family:sans-serif;"
+                    f"max-width:40em;margin:2em auto'>"
+                    f"<h2>tgstream: {html.escape(CFG['name'])}</h2>{body}")
+            self._send(page.encode(), "text/html")
             return
         routes = {
-            "/status": (lambda: json.dumps(STATE.snapshot()),
-                        "application/json"),
+            "/status": (lambda: json.dumps(STATE.snapshot()), "application/json"),
             "/playlist.m3u": (render_playlist, "audio/x-mpegurl"),
             "/epg.xml": (render_epg, "application/xml"),
         }
-        route = routes.get(path)
-        if route is None:
+        r = routes.get(path)
+        if r is None:
             self.send_error(404)
-            return
-        self._send(route[0]().encode(), route[1])
+        else:
+            self._send(r[0]().encode(), r[1])
 
     def do_POST(self):
         if self.path.split("?")[0] != "/login/password":
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))
+        import urllib.parse
         form = urllib.parse.parse_qs(self.rfile.read(length).decode())
-        password = (form.get("password") or [""])[0]
-        if password:
+        pw = (form.get("password") or [""])[0]
+        if pw:
             with STATE.lock:
-                STATE.pending_password = password
-        # Redirect back; the capture loop types the password into the page.
+                STATE.pending_password = pw
         self.send_response(303)
         self.send_header("Location", "/login")
         self.end_headers()
 
-    def log_message(self, fmt, *args):  # keep the service log readable
+    def _serve_continuous_ts(self):
+        # Never-ending MPEG-TS for Plex's HDHomeRun client: stream segment
+        # files back to back as they are produced, starting near live.
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.end_headers()
+        nxt = max(0, HLS.latest_index() - 3)
+        idle = 0
+        while True:
+            seg = os.path.join(HLS_DIR, f"s{nxt}.ts")
+            if os.path.exists(seg):
+                try:
+                    with open(seg, "rb") as f:
+                        self.wfile.write(f.read())
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                nxt += 1
+                idle = 0
+            else:
+                if nxt < HLS.latest_index() - CFG["window"] - CFG["grace"]:
+                    nxt = HLS.latest_index()  # fell too far behind
+                time.sleep(0.2)
+                idle += 1
+                if idle > 3000:
+                    return
+
+    def log_message(self, *a):
         pass
 
 
+def start_http():
+    srv = ThreadingHTTPServer(("0.0.0.0", CFG["http_port"]), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log(f"HTTP on :{CFG['http_port']} (stream {STREAM_URL})")
+
+
 # ---------------------------------------------------------------------------
-# Capture loop
+# Slate: publish a static card as HLS when no stream is live, so Plex never
+# sees a dead tuner. Generated once by make-slate into /state/slate.ts.
+# ---------------------------------------------------------------------------
+
+def slate_loop(stop_evt):
+    slate = os.path.join(CFG["state_dir"], "slate.ts")
+    if not os.path.exists(slate):
+        log("No slate.ts - idle channel will have no filler")
+        return
+    with open(slate, "rb") as f:
+        data = f.read()
+    dur = 10.0
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nk=1:nw=1", slate],
+            capture_output=True, text=True)
+        dur = float(p.stdout.strip() or 10.0)
+    except (ValueError, OSError):
+        pass
+    HLS.reset_offset()
+    while not stop_evt.is_set():
+        idx = HLS.idx
+        out_ts = os.path.join(HLS_DIR, f"s{idx}.ts")
+        part = out_ts + ".part"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-i", slate, "-c", "copy", "-muxdelay", "0",
+             "-output_ts_offset", f"{HLS.off:.3f}", "-f", "mpegts", part],
+            check=False)
+        try:
+            os.replace(part, out_ts)
+        except OSError:
+            break
+        with HLS.lock:
+            HLS.segs.append((idx, dur, HLS.disc_pending))
+            HLS.disc_pending = False
+            if len(HLS.segs) > CFG["window"]:
+                HLS.segs.pop(0)
+                HLS.seq += 1
+            HLS._write_playlist()
+            HLS.off += dur
+            HLS.idx += 1
+        old = os.path.join(HLS_DIR, f"s{idx - CFG['window'] - CFG['grace']}.ts")
+        if os.path.exists(old):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        stop_evt.wait(dur * 0.8)
+
+
+# ---------------------------------------------------------------------------
+# MTProto capture
 # ---------------------------------------------------------------------------
 
 class Capture:
     def __init__(self):
-        self.ffmpeg = Ffmpeg()
-        self.browser = None
-        self.live_start = None
-        self.live_title = None
-        self.last_video_ok = None
-        self.last_clock = None
-        self.join_failures = 0
-        self.last_join_attempt = 0.0
+        self.client = None
+        self.entity = None
 
-    def channel_url(self):
-        peer = CFG["peer"].strip()
-        if "t.me/+" in peer or "joinchat/" in peer:
-            invite = peer.rstrip("/").split("+")[-1] if "/+" in peer \
-                else peer.rstrip("/").split("joinchat/")[-1]
-            return ("https://web.telegram.org/k/#?tgaddr="
-                    f"tg%3A%2F%2Fjoin%3Finvite%3D{invite}")
-        if "t.me/" in peer:
-            peer = "@" + peer.rstrip("/").split("t.me/")[-1]
-        if peer.startswith("@"):
-            return f"https://web.telegram.org/k/#{peer}"
-        # Bare numeric channel id, e.g. -1001234567890.
-        return f"https://web.telegram.org/k/#{peer}"
-
-    # -- integrated QR login --------------------------------------------------
-
-    def check_authorized(self):
-        return bool(self.browser.evaluate(AUTH_PROBE_JS).get("authorized"))
-
-    def ensure_jsqr(self):
-        # SPA navigations recreate the JS context and drop injected globals.
-        if self.browser.evaluate("typeof jsQR") == "undefined":
-            self.browser.evaluate(JSQR_SRC)
-
-    def login_tick(self):
-        """One needs-login poll: submit a pending 2FA password, or mirror the
-        current QR to /qr.png and (on token change) to the log."""
-        if self.browser.evaluate(PASSWORD_PRESENT_JS):
+    async def qr_login(self):
+        import base64
+        if await self.client.is_user_authorized():
+            return
+        STATE.set(state="needs-login")
+        qr = await self.client.qr_login()
+        last_printed = None
+        while True:
+            STATE.set(title="")
+            url = qr.url
+            png = self._qr_png(url)
             with STATE.lock:
-                STATE.password_needed = True
-            password = STATE.take_password()
-            if password:
-                log("Submitting 2FA password")
-                self.browser.evaluate(
-                    SUBMIT_PASSWORD_JS.replace(
-                        "__PASSWORD__", json.dumps(password)))
-                time.sleep(2)
-            return
-        with STATE.lock:
-            STATE.password_needed = False
-        self.ensure_jsqr()
-        result = self.browser.evaluate(QR_MIRROR_JS)
-        if not result.get("data"):
-            return
-        png = base64.b64decode(result["png"].split(",", 1)[1])
-        if STATE.set_qr(result["data"], png):
-            self.print_login_qr(result["data"])
-
-    def print_login_qr(self, token):
-        try:
-            qr = subprocess.run(
-                ["qrencode", "-t", "UTF8"], input=token.encode(),
-                capture_output=True, check=True).stdout.decode()
-        except (OSError, subprocess.CalledProcessError) as exc:
-            log(f"qrencode failed: {exc}")
-            qr = f"(QR render failed - open the link manually)\n{token}"
-        login_url = (f"http://{CFG['public_host']}:{CFG['public_http_port']}"
-                     "/login")
-        print(
-            "\n==== TELEGRAM LOGIN REQUIRED ====\n"
-            "Scan with the Telegram app: Settings -> Devices -> "
-            "Link Desktop Device\n"
-            f"(or open {login_url} in a browser)\n\n"
-            f"{qr}\n"
-            "The code rotates every ~30s; a fresh one is printed on each "
-            "rotation.\n",
-            flush=True)
-
-    # -- detection (narrow interface, swappable in Phase 2) ------------------
-
-    def probe_live(self):
-        """is_live() -> (bool, title)."""
-        result = self.browser.evaluate(PROBE_JS)
-        return bool(result["live"]), (result["title"] or "").strip()
-
-    # -- join ---------------------------------------------------------------
-
-    def rejoin_page(self):
-        # A reload auto-rejoins the previous (possibly stuck) call and K
-        # never auto-opens the player for a rejoined call. Only a fresh
-        # browser boot reliably resets to the pre-join Join bar.
-        self.browser.close()
-        self.browser.launch(self.channel_url())
-        time.sleep(8)
-
-    def join(self):
-        """Click into the live stream and stage its <video>. True on success."""
-        try:
-            # Shed any stuck call from a previous attempt: joins re-attached
-            # on boot never open the player. Leave, wait for the Join bar,
-            # then join fresh.
-            if self.browser.evaluate(LEAVE_STUCK_CALL_JS) == "left":
-                log("Left a stuck call from a previous attempt")
-                time.sleep(4)
-                self.probe_live()  # re-mark the (hopefully) fresh live bar
-            self.browser.evaluate(CLICK_LIVE_BAR_JS)
-        except BrowserError as exc:
-            STATE.set(error=f"join click failed: {exc}")
-            return False
-
-        start = time.monotonic()
-        deadline = start + CFG["join_timeout"]
-        opened = False
-        while time.monotonic() < deadline:
+                STATE.qr_png = png
+                STATE.qr_token = url
+            if url != last_printed:
+                self._print_qr(url)
+                last_printed = url
+            # 2FA password, if the user submitted one via /login.
+            with STATE.lock:
+                pw = STATE.pending_password
+                STATE.pending_password = None
             try:
-                if self.browser.evaluate(STAGE_VIDEO_JS):
-                    self.last_clock = None
-                    self.last_video_ok = time.monotonic()
-                    return True
-                # A confirm dialog ("Join"/"Watch") may pop; press it if seen.
-                self.browser.evaluate(CLICK_JOIN_JS)
-                # RTMP streams: after joining, the stream player normally
-                # auto-opens within seconds. If it hasn't, click the call bar
-                # open ONCE - the click toggles the player, so repeating it
-                # closes a player that is still loading. On failure the page
-                # is reloaded anyway, which resets this state machine.
-                if not opened and time.monotonic() - start > 15:
-                    self.browser.evaluate(OPEN_PLAYER_JS)
-                    opened = True
-            except BrowserError as exc:
-                STATE.set(error=f"join evaluate failed: {exc}")
-                return False
-            time.sleep(1)
-        STATE.set(error="no playing <video> before JOIN_TIMEOUT")
-        return False
-
-    def video_advancing(self):
-        """True while the staged video's clock moves forward."""
-        clock = self.browser.evaluate(VIDEO_CLOCK_JS)
-        if clock is None or clock["ended"]:
-            return False
-        advancing = self.last_clock is None or clock["t"] > self.last_clock
-        self.last_clock = clock["t"]
-        if clock["paused"]:
-            self.browser.evaluate(STAGE_VIDEO_JS)  # kick playback
-        return advancing
-
-    # -- state machine ------------------------------------------------------
-
-    def end_stream(self):
-        end_ts = time.time()
-        title = self.live_title or "Stream"
-        start_ts = self.live_start
-        try:
-            self.browser.evaluate(UNSTAGE_JS)
-        except BrowserError:
-            pass
-        self.ffmpeg.ensure("slate")
-        if CFG["record"] and start_ts is not None:
-            threading.Thread(
-                target=harvest, args=(title, start_ts, end_ts),
-                daemon=True).start()
-        self.live_start = None
-        STATE.set(state="idle", title="")
-
-    def tick(self):
-        state = STATE.snapshot()["state"]
-
-        if state in ("starting", "needs-login"):
-            self.ffmpeg.ensure("slate")
-            if self.check_authorized():
-                if state == "needs-login":
-                    log("Login complete - session saved in /state/profile")
-                    STATE.clear_login()
-                    # The SPA ignores runtime hash navigation (and rewrites
-                    # the hash back), so a fresh boot with the channel URL is
-                    # the only reliable way to open the chat.
-                    self.browser.close()
-                    self.browser.launch(self.channel_url())
-                    time.sleep(5)
-                STATE.set(state="idle")
-                return
-            if state == "starting":
-                STATE.set(state="needs-login")
-                log("No Telegram session - waiting for QR login")
-            self.login_tick()
-            return
-
-        if state in ("idle", "join-failed"):
-            self.ffmpeg.ensure("slate")
-            # A session revoked from the phone looks like the auth screen.
-            if not self.check_authorized():
-                log("Telegram session lost - returning to QR login")
-                STATE.set(state="needs-login")
-                return
-            live, title = self.probe_live()
-            if not live:
-                self.join_failures = 0
-                if state == "join-failed":
-                    STATE.set(state="idle")
-                return
-            # Back off after repeated failures: each attempt costs a full
-            # browser relaunch + JOIN_TIMEOUT, and a channel with a phantom
-            # call (bar up, no playable video - some channels idle that way
-            # for hours) would otherwise burn a CPU core relaunching Chromium
-            # every minute.
-            if state == "join-failed" and self.join_failures >= 3 \
-                    and time.monotonic() - self.last_join_attempt < 300:
-                return
-            STATE.set(state="joining", title=title)
-            self.last_join_attempt = time.monotonic()
-            if self.join():
-                self.live_start = time.time()
-                self.live_title = title or CFG["name"]
-                self.join_failures = 0
-                self.ffmpeg.ensure("live")
-                STATE.set(state="live", title=self.live_title)
-            else:
-                self.join_failures += 1
-                self.rejoin_page()
-                STATE.set(state="join-failed")
-            return
-
-        if state == "live":
-            self.ffmpeg.ensure("live")
-            now = time.monotonic()
-            # Re-stage every tick: idempotent, and upgrades to the player's
-            # main video if a thumbnail was staged before it finished loading.
-            try:
-                if self.browser.evaluate(STAGE_VIDEO_JS) == "seeked":
-                    # Seeking to the live edge stalls playback for a few
-                    # seconds while the player rebuffers - don't let the
-                    # stall watchdog count that time.
-                    self.last_video_ok = now
-                    self.last_clock = None
-                    return
-            except BrowserError:
+                if await qr.wait(timeout=20):
+                    break
+            except asyncio.TimeoutError:
                 pass
-            if self.video_advancing():
-                self.last_video_ok = now
-                return
-            # Stalled. If the live bar is still up, try to re-stage/rejoin;
-            # if it is gone past the grace window, the stream has ended.
-            live, _ = self.probe_live()
-            if now - self.last_video_ok > CFG["end_grace"]:
-                log("Video gone past END_GRACE - ending stream")
-                self.end_stream()
-            elif live and now - self.last_video_ok > 20:
-                log("Video stalled while still live - rejoining")
-                self.rejoin_page()
-                self.probe_live()  # re-mark the bar for join()
-                self.join()
+            except SessionPasswordNeededError:
+                with STATE.lock:
+                    STATE.password_needed = True
+                if pw:
+                    await self.client.sign_in(password=pw)
+                    break
+            await qr.recreate()
+        with STATE.lock:
+            STATE.qr_png = None
+            STATE.qr_token = None
+            STATE.password_needed = False
+        log("Login complete - session saved in /state")
 
-    def run(self):
+    def _qr_png(self, url):
+        try:
+            p = subprocess.run(["qrencode", "-t", "PNG", "-o", "-", "-s", "6",
+                                url], capture_output=True)
+            return p.stdout or None
+        except OSError:
+            return None
+
+    def _print_qr(self, url):
+        try:
+            qr = subprocess.run(["qrencode", "-t", "UTF8", url],
+                                capture_output=True, text=True).stdout
+        except OSError:
+            qr = url
+        login = (f"http://{CFG['public_host']}:{CFG['public_http_port']}/login")
+        print(f"\n==== TELEGRAM LOGIN REQUIRED ({CFG['name']}) ====\n"
+              f"Scan with Telegram: Settings -> Devices -> Link Desktop Device\n"
+              f"(or open {login} )\n\n{qr}\n"
+              f"Code rotates ~every 30s.\n", flush=True)
+
+    async def live_call(self):
+        full = await self.client(
+            functions.channels.GetFullChannelRequest(channel=self.entity))
+        return full.full_chat.call
+
+    async def join(self, call):
+        params = json.dumps({"fingerprints": [], "pwd": "", "ssrc": JOIN_SSRC,
+                             "ssrc-groups": [], "ufrag": ""})
+        await self.client(functions.phone.JoinGroupCallRequest(
+            call=call, join_as=types.InputPeerSelf(), muted=True,
+            video_stopped=True, params=types.DataJSON(data=params)))
+
+    async def fetch(self, call, ts, scale):
+        loc = types.InputGroupCallStream(
+            call=call, time_ms=ts, scale=scale, video_channel=1,
+            video_quality=CFG["video_quality"])
+        try:
+            res = await self.client(functions.upload.GetFileRequest(
+                location=loc, offset=0, limit=1024 * 1024))
+            return ("ok", res.bytes[32:])
+        except RPCError as e:
+            s = str(e)
+            for k, tag in (("TIME_TOO_BIG", "big"), ("TIME_TOO_SMALL", "small"),
+                           ("TIME_INVALID", "rejoin"),
+                           ("GROUPCALL_JOIN_MISSING", "rejoin")):
+                if k in s:
+                    return (tag, None)
+            if "JoinMissing" in repr(e):
+                return ("rejoin", None)
+            return ("err", repr(e))
+
+    async def stream_call(self, call):
+        """Download and publish one live call until it ends."""
+        ch = await self.client(
+            functions.phone.GetGroupCallStreamChannelsRequest(call=call))
+        if not ch.channels:
+            return
+        scale = ch.channels[0].scale
+        seg = 1000 >> scale
+        t0 = (ch.channels[0].last_timestamp_ms // seg) * seg - CFG["buffer_ms"]
+
+        title = STATE.title
+        REC.begin(title)
+        STATE.set(state="live")
+        HLS.reset_offset()
+
+        queue = asyncio.Queue(maxsize=8)
+        loop = asyncio.get_event_loop()
+
+        async def producer():
+            t = t0
+            big = 0
+            while True:
+                status, data = await self.fetch(call, t, scale)
+                if status == "ok":
+                    big = 0
+                    await queue.put(data)
+                    t += seg
+                elif status == "big":
+                    await asyncio.sleep(0.2)
+                    big += 1
+                    if big > 150:
+                        if (await self.live_call()) is None:
+                            break
+                        big = 0
+                elif status == "small":
+                    t += seg
+                elif status == "rejoin":
+                    break
+                else:
+                    log(f"getFile: {data}")
+                    await asyncio.sleep(0.5)
+            await queue.put(None)
+
+        async def consumer():
+            while True:
+                data = await queue.get()
+                if data is None:
+                    break
+                await loop.run_in_executor(
+                    None, HLS.add, data,
+                    REC.add if REC.active else None)
+
+        await asyncio.gather(producer(), consumer())
+        REC.finish()
+
+    async def run(self):
+        os.makedirs(CFG["state_dir"], exist_ok=True)
+        self.client = TelegramClient(
+            os.path.join(CFG["state_dir"], "session"),
+            CFG["api_id"], CFG["api_hash"])
+        await self.client.connect()
+        await self.qr_login()
+        self.entity = await self.client.get_entity(CFG["peer"])
+
+        stop_slate = threading.Event()
+        slate_thread = None
+
+        def start_slate():
+            nonlocal slate_thread
+            stop_slate.clear()
+            slate_thread = threading.Thread(
+                target=slate_loop, args=(stop_slate,), daemon=True)
+            slate_thread.start()
+
+        def stop_slate_fn():
+            stop_slate.set()
+
+        STATE.set(state="idle")
+        start_slate()
         while True:
             try:
-                STATE.set(state="starting")
-                self.browser = Browser()
-                self.browser.launch(self.channel_url())
-                time.sleep(5)  # let Telegram Web boot
-                while True:
-                    self.tick()
-                    # Poll fast while mirroring the login QR (it rotates
-                    # every ~30s); normal cadence otherwise.
-                    if STATE.snapshot()["state"] == "needs-login":
-                        time.sleep(1)
-                    else:
-                        time.sleep(CFG["poll_interval"])
-            except BrowserError as exc:
-                STATE.set(error=f"browser failure: {exc}")
-            except Exception as exc:  # noqa: BLE001
-                STATE.set(error=f"unexpected: {exc}")
-            # A dying browser mid-live still leaves segments on disk; harvest
-            # what we have before relaunching.
-            if self.live_start is not None and CFG["record"]:
-                threading.Thread(
-                    target=harvest,
-                    args=(self.live_title or "Stream", self.live_start, time.time()),
-                    daemon=True).start()
-                self.live_start = None
-            if self.browser is not None:
-                self.browser.close()
-                self.browser = None
-            self.ffmpeg.ensure("slate")
-            log("Relaunching browser in 10s")
-            time.sleep(10)
+                call = await self.live_call()
+            except RPCError as e:
+                STATE.set(error=f"detect: {e!r}")
+                await asyncio.sleep(CFG["poll_interval"])
+                continue
+            if call is None:
+                if STATE.snapshot()["state"] != "idle":
+                    STATE.set(state="idle", title="")
+                    start_slate()
+                await asyncio.sleep(CFG["poll_interval"])
+                continue
+            # Live: stop slate, join, stream until it ends.
+            stop_slate_fn()
+            try:
+                await self.join(call)
+            except RPCError as e:
+                STATE.set(error=f"join: {e!r}")
+                await asyncio.sleep(3)
+                start_slate()
+                continue
+            try:
+                await self.stream_call(call)
+            except Exception as e:  # noqa: BLE001
+                STATE.set(error=f"stream: {e!r}")
+            STATE.set(state="idle", title="")
+            start_slate()
+            await asyncio.sleep(2)
 
 
 def main():
-    server = ThreadingHTTPServer(("0.0.0.0", CFG["http_port"]), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log(f"HTTP endpoints on :{CFG['http_port']}, stream at {STREAM_URL}")
-    Capture().run()
+    start_http()
+    Capture_ = Capture()
+    asyncio.run(Capture_.run())
 
 
 if __name__ == "__main__":
