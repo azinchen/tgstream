@@ -239,6 +239,19 @@ CLICK_LIVE_BAR_JS = """
 })()
 """.replace("__JOIN_BUTTON__", LIVE_JOIN_BUTTON)
 
+# After joining an RTMP stream the in-call bar appears but the stream player
+# (and its <video>) only materializes when the bar is clicked open.
+OPEN_PLAYER_JS = """
+(() => {
+    if ([...document.querySelectorAll('video')].some(v => v.readyState >= 2))
+        return 'player open';
+    const c = document.querySelector('.topbar-call-center');
+    if (!c) return 'no call bar';
+    c.click();
+    return 'clicked';
+})()
+"""
+
 CLICK_JOIN_JS = """
 (() => {
     const texts = __TEXTS__;
@@ -300,17 +313,18 @@ QR_MIRROR_JS = """
 })()
 """
 
-# Selector-free video handling: find the largest playing <video>, reparent it
-# into a full-viewport stage and hide everything else. Survives UI churn.
+# Selector-free video handling: find the largest loaded <video> (K's stream
+# player opens PAUSED - readyState 4 but paused:true - so paused videos
+# count), reparent it into a full-viewport stage and start playback.
 STAGE_VIDEO_JS = """
 (() => {
-    const playing = [...document.querySelectorAll('video')].filter(v => {
-        return v.readyState >= 2 && !v.paused && v.videoWidth > 0;
+    const loaded = [...document.querySelectorAll('video')].filter(v => {
+        return v.readyState >= 2 && v.videoWidth > 0;
     });
-    if (!playing.length) return false;
-    playing.sort((a, b) =>
+    if (!loaded.length) return false;
+    loaded.sort((a, b) =>
         (b.videoWidth * b.videoHeight) - (a.videoWidth * a.videoHeight));
-    const v = playing[0];
+    const v = loaded[0];
     let stage = document.getElementById('tgstream-stage');
     if (!stage) {
         stage = document.createElement('div');
@@ -949,6 +963,9 @@ class Capture:
             try:
                 # A confirm dialog ("Join"/"Watch") may pop; press it if seen.
                 self.browser.evaluate(CLICK_JOIN_JS)
+                # RTMP streams: joining shows the in-call bar, but the stream
+                # player with its <video> only opens on a bar click.
+                self.browser.evaluate(OPEN_PLAYER_JS)
                 if self.browser.evaluate(STAGE_VIDEO_JS):
                     self.last_clock = None
                     self.last_video_ok = time.monotonic()
