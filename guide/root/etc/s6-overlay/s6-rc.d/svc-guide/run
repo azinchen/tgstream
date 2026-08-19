@@ -75,19 +75,32 @@ build_epg()
     jq -r --arg us "$US" '.[] | [.slug, .name, .state, (.title // ""), (.since_ts // 0 | floor), (.logo // "")] | join($us)' \
         "$status_file" \
     | while IFS="$US" read -r slug name state title since_ts logo; do
+        # Horizon must exceed the servers' guide-refresh interval (24h by
+        # default) or the grid goes empty between refreshes.
         if [ "$state" = "live" ]; then
             [ -n "$title" ] || title="$name live"
             printf '  <programme start="%s" stop="%s" channel="%s">\n' \
                 "$(xmltv_time "$since_ts")" \
-                "$(xmltv_time "$((now + 4 * 3600))")" "$slug"
+                "$(xmltv_time "$((hour + 6 * 3600))")" "$slug"
             printf '    <title>%s</title>\n' \
                 "$(printf '%s' "$title" | xml_escape)"
             prog_icon "$logo"
             printf '  </programme>\n'
+            i=6
+            while [ "$i" -lt 36 ]; do
+                printf '  <programme start="%s" stop="%s" channel="%s">\n' \
+                    "$(xmltv_time "$((hour + i * 3600))")" \
+                    "$(xmltv_time "$((hour + (i + 1) * 3600))")" "$slug"
+                printf '    <title>%s (no stream)</title>\n' \
+                    "$(printf '%s' "$name" | xml_escape)"
+                prog_icon "$logo"
+                printf '  </programme>\n'
+                i=$((i + 1))
+            done
         else
             # Plex refuses channels without guide data - fill hour blocks.
             i=0
-            while [ "$i" -lt 12 ]; do
+            while [ "$i" -lt 36 ]; do
                 printf '  <programme start="%s" stop="%s" channel="%s">\n' \
                     "$(xmltv_time "$((hour + i * 3600))")" \
                     "$(xmltv_time "$((hour + (i + 1) * 3600))")" "$slug"

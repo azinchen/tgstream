@@ -407,12 +407,18 @@ def render_epg():
             out.append(f'    <icon src="{html.escape(s["logo"])}" />')
         out.append('  </programme>')
 
+    # Horizon must exceed the servers' guide-refresh interval (24h by
+    # default) or the grid goes empty between refreshes.
     if s["state"] == "live" and s["since"]:
         since = datetime.datetime.fromisoformat(s["since"])
-        prog(since, now + datetime.timedelta(hours=4),
+        prog(since, now + datetime.timedelta(hours=6),
              s["title"] or f"{s['name']} live")
+        for i in range(6, 36):
+            prog(now + datetime.timedelta(hours=i),
+                 now + datetime.timedelta(hours=i + 1),
+                 f"{s['name']} (no stream)")
     else:
-        for i in range(12):
+        for i in range(36):
             prog(now + datetime.timedelta(hours=i),
                  now + datetime.timedelta(hours=i + 1),
                  f"{s['name']} (no stream)")
