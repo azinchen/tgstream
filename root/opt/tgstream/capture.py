@@ -49,6 +49,8 @@ CFG = {
     "bitrate": env("CAPTURE_BITRATE", "4500k"),
     "encoder": env("CAPTURE_ENCODER", "cpu"),
     "vaapi_device": env("VAAPI_DEVICE", "/dev/dri/renderD128"),
+    # Residual constant A/V offset in seconds; positive delays audio.
+    "audio_offset": float(env("AUDIO_OFFSET", "0")),
     "record": env("RECORD", "true").lower() == "true",
     "poll_interval": float(env("POLL_INTERVAL", "5")),
     "end_grace": float(env("END_GRACE", "45")),
@@ -646,14 +648,27 @@ class Ffmpeg:
                 "-c", "copy",
                 "-f", "flv", PUBLISH_URL,
             ]
+        # A/V sync: both inputs are stamped with the same wallclock so the
+        # muxer can align them; thread_queue_size stops queue starvation
+        # under encoder load (a classic drift source); small pulse fragments
+        # cut audio buffering latency. AUDIO_OFFSET shifts audio for any
+        # residual constant offset (positive = delay audio).
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-thread_queue_size", "1024",
+            "-use_wallclock_as_timestamps", "1",
             "-f", "x11grab",
             "-framerate", str(CFG["fps"]),
             "-video_size", f"{CFG['width']}x{CFG['height']}",
             "-draw_mouse", "0",
             "-i", CFG["display"],
-            "-f", "pulse", "-i", "tgcap.monitor",
+            "-thread_queue_size", "1024",
+            "-use_wallclock_as_timestamps", "1",
+        ]
+        if CFG["audio_offset"] != 0.0:
+            cmd += ["-itsoffset", str(CFG["audio_offset"])]
+        cmd += [
+            "-f", "pulse", "-fragment_size", "4096", "-i", "tgcap.monitor",
         ]
         gop = str(CFG["fps"] * 2)
         if CFG["encoder"] == "vaapi":
@@ -681,6 +696,7 @@ class Ffmpeg:
                 "-g", gop,
             ]
         cmd += [
+            "-af", "aresample=async=1",
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
             "-f", "flv", PUBLISH_URL,
         ]

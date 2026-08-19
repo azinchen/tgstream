@@ -152,6 +152,7 @@ later orphans existing recordings.
 | `POLL_INTERVAL` | `5` | seconds between liveness checks |
 | `END_GRACE` | `45` | seconds to ride out a flapping stream |
 | `JOIN_TIMEOUT` | `45` | seconds to wait for a playing `<video>` |
+| `AUDIO_OFFSET` | `0` | constant A/V correction in seconds; positive delays audio (e.g. `0.3`), negative advances it |
 | `DEBUG_VNC` | `false` | expose the browser on port 5900 |
 
 HTTP endpoints on `:8409` (capture and guide alike): `/playlist.m3u`,
