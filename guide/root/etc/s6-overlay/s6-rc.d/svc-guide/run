@@ -50,11 +50,14 @@ build_epg()
     printf '<tv generator-info-name="tgstream-guide">\n'
 
     # XMLTV requires all <channel> elements before any <programme>.
-    jq -r '.[] | [.slug, .name] | @tsv' "$status_file" \
-    | while IFS="$(printf '\t')" read -r slug name; do
+    US2="$(printf '\037')"
+    jq -r --arg us "$US2" '.[] | [.slug, .name, (.logo // "")] | join($us)' "$status_file" \
+    | while IFS="$US2" read -r slug name logo; do
         printf '  <channel id="%s">\n' "$slug"
         printf '    <display-name>%s</display-name>\n' \
             "$(printf '%s' "$name" | xml_escape)"
+        [ -n "$logo" ] && printf '    <icon src="%s" />\n' \
+            "$(printf '%s' "$logo" | xml_escape)"
         printf '  </channel>\n'
     done
 
@@ -114,7 +117,7 @@ while true; do
 
     {
         printf '#EXTM3U\n'
-        jq -r '.[] | "#EXTINF:-1 tvg-id=\"\(.slug)\" tvg-name=\"\(.name)\" tvg-chno=\"\(.channel_number)\" group-title=\"Telegram\",\(.name)\n\(.url)"' \
+        jq -r '.[] | "#EXTINF:-1 tvg-id=\"\(.slug)\" tvg-name=\"\(.name)\" tvg-chno=\"\(.channel_number)\"\((.logo // "") | if . != "" then " tvg-logo=\"\(.)\"" else "" end) group-title=\"Telegram\",\(.name)\n\(.url)"' \
             "$OUT/status"
     } > "$OUT/playlist.m3u.new"
     mv "$OUT/playlist.m3u.new" "$OUT/playlist.m3u"

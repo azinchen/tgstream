@@ -61,10 +61,15 @@ CFG = {
 PATH = f"tg-{CFG['slug']}"
 HLS_DIR = os.path.join(CFG["run_dir"], "hls")
 REC_DIR = os.path.join(CFG["run_dir"], "rec")
-STREAM_URL = (f"http://{CFG['public_host']}:{CFG['public_http_port']}"
-              f"/stream.m3u8")
+BASE_URL = f"http://{CFG['public_host']}:{CFG['public_http_port']}"
+STREAM_URL = f"{BASE_URL}/stream.m3u8"
+LOGO_FILE = os.path.join(CFG["state_dir"], "logo.jpg")
 XMLTV_FMT = "%Y%m%d%H%M%S %z"
 JOIN_SSRC = 0x50000000
+
+
+def logo_url():
+    return f"{BASE_URL}/logo.jpg" if os.path.exists(LOGO_FILE) else ""
 
 
 def log(msg):
@@ -148,7 +153,7 @@ class State:
                 "title": self.title,
                 "since": self.since.isoformat() if self.since else None,
                 "since_ts": self.since.timestamp() if self.since else None,
-                "url": STREAM_URL, "record": CFG["record"],
+                "url": STREAM_URL, "logo": logo_url(), "record": CFG["record"],
                 "last_error": self.last_error,
             }
 
@@ -367,10 +372,12 @@ REC = Recorder()
 
 def render_playlist():
     s = STATE.snapshot()
+    logo = f' tvg-logo="{s["logo"]}"' if s.get("logo") else ""
     return "\n".join([
         "#EXTM3U",
         (f'#EXTINF:-1 tvg-id="{s["slug"]}" tvg-name="{s["name"]}" '
-         f'tvg-chno="{s["channel_number"]}" group-title="Telegram",{s["name"]}'),
+         f'tvg-chno="{s["channel_number"]}"{logo} '
+         f'group-title="Telegram",{s["name"]}'),
         s["url"], ""])
 
 
@@ -381,8 +388,10 @@ def render_epg():
     out = ['<?xml version="1.0" encoding="UTF-8"?>',
            '<tv generator-info-name="tgstream">',
            f'  <channel id="{s["slug"]}">',
-           f'    <display-name>{html.escape(s["name"])}</display-name>',
-           '  </channel>']
+           f'    <display-name>{html.escape(s["name"])}</display-name>']
+    if s.get("logo"):
+        out.append(f'    <icon src="{html.escape(s["logo"])}" />')
+    out.append('  </channel>')
 
     def prog(a, b, title):
         out.append(f'  <programme start="{a.strftime(XMLTV_FMT)}" '
@@ -447,6 +456,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/stream.ts":
             self._serve_continuous_ts()
+            return
+        if path == "/logo.jpg":
+            if os.path.exists(LOGO_FILE):
+                with open(LOGO_FILE, "rb") as f:
+                    self._send(f.read(), "image/jpeg")
+            else:
+                self.send_error(404)
             return
         if re.fullmatch(r"/s\d+\.ts", path):
             seg = HLS.segment_path(path.lstrip("/"))
@@ -656,6 +672,19 @@ class Capture:
               f"(or open {login} )\n\n{qr}\n"
               f"Code rotates ~every 30s.\n", flush=True)
 
+    async def fetch_logo(self):
+        # Download the channel's profile photo -> /state/logo.jpg, exposed at
+        # /logo.jpg and advertised as tvg-logo / <icon> in the guide.
+        try:
+            path = await self.client.download_profile_photo(
+                self.entity, file=LOGO_FILE)
+            if path:
+                log("Channel logo saved")
+            elif os.path.exists(LOGO_FILE):
+                os.remove(LOGO_FILE)  # channel photo removed
+        except (RPCError, OSError) as exc:
+            log(f"logo fetch failed: {exc}")
+
     async def resolve_peer(self):
         peer = CFG["peer"].strip()
         if peer.startswith("@") or "t.me/" in peer:
@@ -834,6 +863,7 @@ class Capture:
         await self.client.connect()
         await self.qr_login()
         self.entity = await self.resolve_peer()
+        await self.fetch_logo()
 
         stop_slate = threading.Event()
         slate_thread = None
