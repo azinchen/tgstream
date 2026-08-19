@@ -230,12 +230,19 @@ PROBE_JS = """
 
 CLICK_LIVE_BAR_JS = """
 (() => {
-    // Prefer the live bar's explicit Join control; fall back to clicking
-    // the marked bar itself.
+    // Prefer the live bar's explicit Join control. Never blind-click an
+    // in-call bar (pinned-call) - that area holds mic/leave buttons.
     const btn = document.querySelector('__JOIN_BUTTON__');
-    if (btn && btn.getBoundingClientRect().width > 0) { btn.click(); return; }
+    if (btn && btn.getBoundingClientRect().width > 0) {
+        btn.click();
+        return 'join';
+    }
     const el = document.querySelector('[data-tgstream-live]');
-    if (el) el.click();
+    if (el && !(el.className || '').toString().includes('pinned-call')) {
+        el.click();
+        return 'bar';
+    }
+    return 'already joined';
 })()
 """.replace("__JOIN_BUTTON__", LIVE_JOIN_BUTTON)
 
@@ -996,7 +1003,7 @@ class Capture:
 
         start = time.monotonic()
         deadline = start + CFG["join_timeout"]
-        last_open_click = 0.0
+        opened = False
         while time.monotonic() < deadline:
             try:
                 if self.browser.evaluate(STAGE_VIDEO_JS):
@@ -1005,14 +1012,14 @@ class Capture:
                     return True
                 # A confirm dialog ("Join"/"Watch") may pop; press it if seen.
                 self.browser.evaluate(CLICK_JOIN_JS)
-                # RTMP streams: the stream player only opens on a call-bar
-                # click - and the click toggles, so give joining a few
-                # seconds first and retry sparingly while nothing loads.
-                now = time.monotonic()
-                if now - start > 4 and now - last_open_click > 12:
-                    result = self.browser.evaluate(OPEN_PLAYER_JS)
-                    if result == "clicked":
-                        last_open_click = now
+                # RTMP streams: after joining, the stream player normally
+                # auto-opens within seconds. If it hasn't, click the call bar
+                # open ONCE - the click toggles the player, so repeating it
+                # closes a player that is still loading. On failure the page
+                # is reloaded anyway, which resets this state machine.
+                if not opened and time.monotonic() - start > 15:
+                    self.browser.evaluate(OPEN_PLAYER_JS)
+                    opened = True
             except BrowserError as exc:
                 STATE.set(error=f"join evaluate failed: {exc}")
                 return False
