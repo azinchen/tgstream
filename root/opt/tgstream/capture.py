@@ -720,47 +720,93 @@ class Capture:
                 return ("rejoin", None)
             return ("err", repr(e))
 
-    async def stream_call(self, call):
-        """Download and publish one live call until it ends."""
-        ch = await self.client(
-            functions.phone.GetGroupCallStreamChannelsRequest(call=call))
-        if not ch.channels:
-            return
-        scale = ch.channels[0].scale
-        seg = 1000 >> scale
-        t0 = (ch.channels[0].last_timestamp_ms // seg) * seg - CFG["buffer_ms"]
+    async def keepalive(self, get_call, ended):
+        # Telegram drops a joined member after ~90s without activity, which
+        # made getFile fail and forced a full reconnect (slate + split
+        # recording). checkGroupCall keeps our presence alive; if the server
+        # says our ssrc is gone, re-join in place.
+        while not ended["v"]:
+            await asyncio.sleep(15)
+            call = get_call()
+            try:
+                r = await self.client(functions.phone.CheckGroupCallRequest(
+                    call=call, sources=[JOIN_SSRC]))
+                if JOIN_SSRC not in r:
+                    await self.join(call)
+            except RPCError:
+                try:
+                    await self.join(call)
+                except RPCError:
+                    pass
 
-        title = STATE.title
-        REC.begin(title)
+    async def stream_call(self, call):
+        """Publish a live call, riding out reconnects seamlessly (no slate,
+        no split recording); return only when the call is truly gone."""
+        state = {"call": call, "ended": False}
+        REC.begin(STATE.title)
         STATE.set(state="live")
         HLS.reset_offset()
 
         queue = asyncio.Queue(maxsize=8)
         loop = asyncio.get_event_loop()
+        ended = {"v": False}
 
         async def producer():
-            t = t0
-            big = 0
-            while True:
-                status, data = await self.fetch(call, t, scale)
-                if status == "ok":
-                    big = 0
-                    await queue.put(data)
-                    t += seg
-                elif status == "big":
-                    await asyncio.sleep(0.2)
-                    big += 1
-                    if big > 150:
-                        if (await self.live_call()) is None:
-                            break
+            while not ended["v"]:
+                try:
+                    ch = await self.client(
+                        functions.phone.GetGroupCallStreamChannelsRequest(
+                            call=state["call"]))
+                except RPCError:
+                    if (c := await self.live_call()) is None:
+                        break
+                    state["call"] = c
+                    try:
+                        await self.join(c)
+                    except RPCError:
+                        pass
+                    continue
+                if not ch.channels:
+                    await asyncio.sleep(1)
+                    continue
+                scale = ch.channels[0].scale
+                seg = 1000 >> scale
+                t = ((ch.channels[0].last_timestamp_ms // seg) * seg
+                     - CFG["buffer_ms"])
+                big = 0
+                refetch = False
+                while not ended["v"] and not refetch:
+                    status, data = await self.fetch(state["call"], t, scale)
+                    if status == "ok":
                         big = 0
-                elif status == "small":
-                    t += seg
-                elif status == "rejoin":
-                    break
-                else:
-                    log(f"getFile: {data}")
-                    await asyncio.sleep(0.5)
+                        await queue.put(data)
+                        t += seg
+                    elif status == "big":
+                        await asyncio.sleep(0.2)
+                        big += 1
+                        if big > 150:
+                            if (await self.live_call()) is None:
+                                ended["v"] = True
+                            big = 0
+                    elif status == "small":
+                        t += seg
+                    elif status == "rejoin":
+                        # Presence dropped or call rotated: re-resolve and
+                        # continue live (a discontinuity, not a slate gap).
+                        if (c := await self.live_call()) is None:
+                            ended["v"] = True
+                            break
+                        state["call"] = c
+                        try:
+                            await self.join(c)
+                        except RPCError:
+                            pass
+                        HLS.reset_offset()
+                        refetch = True
+                    else:
+                        log(f"getFile: {data}")
+                        await asyncio.sleep(0.5)
+            ended["v"] = True
             await queue.put(None)
 
         async def consumer():
@@ -769,10 +815,11 @@ class Capture:
                 if data is None:
                     break
                 await loop.run_in_executor(
-                    None, HLS.add, data,
-                    REC.add if REC.active else None)
+                    None, HLS.add, data, REC.add if REC.active else None)
 
-        await asyncio.gather(producer(), consumer())
+        await asyncio.gather(
+            self.keepalive(lambda: state["call"], ended),
+            producer(), consumer())
         REC.finish()
 
     async def run(self):
