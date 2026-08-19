@@ -245,9 +245,10 @@ CLICK_LIVE_BAR_JS = """
 # one still loading) - the guard checks for player videos, not readiness.
 OPEN_PLAYER_JS = """
 (() => {
-    const vids = [...document.querySelectorAll('video')];
-    if (vids.some(v => v.className.toString().includes('media-video')
-                       || v.readyState >= 1))
+    // Only the player's own video (media-video class) proves the player is
+    // open - the live bar carries a circular preview video that must not
+    // satisfy this check.
+    if (document.querySelector('video.media-video'))
         return 'player present';
     const c = document.querySelector('.topbar-call-center');
     if (!c) return 'no call bar';
@@ -333,15 +334,26 @@ STAGE_VIDEO_JS = """
         return v.readyState >= 2 && v.videoWidth > 0;
     });
     if (!loaded.length) return false;
+    const main = loaded.filter(v =>
+        (v.className || '').toString().includes('media-video'));
+    let pool;
+    if (main.length) {
+        pool = main;
+    } else if (document.querySelector('.pinned-call.is-rtmp') ||
+               document.querySelector('.pinned-live')) {
+        // RTMP stream: without the player's media-video, the only loaded
+        // videos are circular bar previews - wait for the real player.
+        return false;
+    } else {
+        pool = loaded;  // video chats have no media-video; take what exists
+    }
     const score = (v) => {
         let s = v.videoWidth * v.videoHeight;
-        const cls = (v.className || '').toString();
-        if (cls.includes('media-video')) s += 100000000;
         if (v.videoWidth === v.videoHeight) s -= 50000000;
         return s;
     };
-    loaded.sort((a, b) => score(b) - score(a));
-    const v = loaded[0];
+    pool.sort((a, b) => score(b) - score(a));
+    const v = pool[0];
     let stage = document.getElementById('tgstream-stage');
     if (!stage) {
         stage = document.createElement('div');
