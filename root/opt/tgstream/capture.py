@@ -63,13 +63,15 @@ HLS_DIR = os.path.join(CFG["run_dir"], "hls")
 REC_DIR = os.path.join(CFG["run_dir"], "rec")
 BASE_URL = f"http://{CFG['public_host']}:{CFG['public_http_port']}"
 STREAM_URL = f"{BASE_URL}/stream.m3u8"
-LOGO_FILE = os.path.join(CFG["state_dir"], "logo.jpg")
+LOGO_SRC = os.path.join(CFG["state_dir"], "logo.jpg")     # square avatar
+LOGO_FILE = os.path.join(CFG["state_dir"], "logo.png")    # 16:9 landscape
+POSTER_FILE = os.path.join(CFG["state_dir"], "poster.png")  # 2:3 portrait
 XMLTV_FMT = "%Y%m%d%H%M%S %z"
 JOIN_SSRC = 0x50000000
 
 
 def logo_url():
-    return f"{BASE_URL}/logo.jpg" if os.path.exists(LOGO_FILE) else ""
+    return f"{BASE_URL}/logo.png" if os.path.exists(LOGO_FILE) else ""
 
 
 def log(msg):
@@ -463,10 +465,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/stream.ts":
             self._serve_continuous_ts()
             return
-        if path == "/logo.jpg":
-            if os.path.exists(LOGO_FILE):
-                with open(LOGO_FILE, "rb") as f:
-                    self._send(f.read(), "image/jpeg")
+        if path in ("/logo.png", "/poster.png", "/logo.jpg"):
+            f_ = {"/logo.png": LOGO_FILE, "/poster.png": POSTER_FILE,
+                  "/logo.jpg": LOGO_SRC}[path]
+            ct = "image/jpeg" if path.endswith(".jpg") else "image/png"
+            if os.path.exists(f_):
+                with open(f_, "rb") as f:
+                    self._send(f.read(), ct)
             else:
                 self.send_error(404)
             return
@@ -679,17 +684,34 @@ class Capture:
               f"Code rotates ~every 30s.\n", flush=True)
 
     async def fetch_logo(self):
-        # Download the channel's profile photo -> /state/logo.jpg, exposed at
-        # /logo.jpg and advertised as tvg-logo / <icon> in the guide.
+        # Download the channel's (square) profile photo, then derive the
+        # aspect ratios Plex uses: 16:9 landscape (/logo.png, guide + On Now,
+        # advertised as tvg-logo / <icon>) and 2:3 portrait (/poster.png, home
+        # posters). The square avatar is centered on a transparent canvas.
         try:
             path = await self.client.download_profile_photo(
-                self.entity, file=LOGO_FILE)
-            if path:
-                log("Channel logo saved")
-            elif os.path.exists(LOGO_FILE):
-                os.remove(LOGO_FILE)  # channel photo removed
-        except (RPCError, OSError) as exc:
+                self.entity, file=LOGO_SRC)
+        except RPCError as exc:
             log(f"logo fetch failed: {exc}")
+            return
+        for f in (LOGO_FILE, POSTER_FILE):
+            try:
+                os.path.exists(f) and os.remove(f)
+            except OSError:
+                pass
+        if not path:
+            return
+        pad = ("format=rgba,scale={sw}:{sh},"
+               "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=#00000000")
+        variants = [
+            (LOGO_FILE, pad.format(sw=-1, sh=270, w=480, h=270)),   # 16:9
+            (POSTER_FILE, pad.format(sw=360, sh=-1, w=360, h=540)),  # 2:3
+        ]
+        for out, vf in variants:
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", LOGO_SRC, "-vf", vf, out], check=False)
+        log("Channel logo saved (square, 16:9, 2:3)")
 
     async def resolve_peer(self):
         peer = CFG["peer"].strip()
