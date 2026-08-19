@@ -264,6 +264,20 @@ OPEN_PLAYER_JS = """
 })()
 """
 
+# A previous failed attempt can leave the account joined to the call
+# server-side; K re-attaches on boot and shows a stuck "Connecting..." bar,
+# and never auto-opens the player for a re-attached call. Leave it first.
+LEAVE_STUCK_CALL_JS = """
+(() => {
+    const bar = document.querySelector('.pinned-call');
+    if (!bar || bar.getBoundingClientRect().width === 0) return 'no call';
+    const btn = bar.querySelector('.topbar-call-end-btn');
+    if (!btn) return 'no leave button';
+    btn.click();
+    return 'left';
+})()
+"""
+
 # Confirm buttons inside popups only ("Join"/"Watch" dialogs) - a global
 # button sweep re-clicks the live bar's own Join and toggles the call.
 CLICK_JOIN_JS = """
@@ -1000,6 +1014,13 @@ class Capture:
     def join(self):
         """Click into the live stream and stage its <video>. True on success."""
         try:
+            # Shed any stuck call from a previous attempt: joins re-attached
+            # on boot never open the player. Leave, wait for the Join bar,
+            # then join fresh.
+            if self.browser.evaluate(LEAVE_STUCK_CALL_JS) == "left":
+                log("Left a stuck call from a previous attempt")
+                time.sleep(4)
+                self.probe_live()  # re-mark the (hopefully) fresh live bar
             self.browser.evaluate(CLICK_LIVE_BAR_JS)
         except BrowserError as exc:
             STATE.set(error=f"join click failed: {exc}")
