@@ -92,10 +92,16 @@ def log(msg):
 # ---------------------------------------------------------------------------
 
 LIVE_BAR_SELECTORS = [
+    # RTMP live streams (verified 2026-08 against a real broadcast): bar text
+    # "Live Stream / N watching / Join", join button below.
+    ".pinned-container.pinned-live",
+    # Video chats / group calls (K can join these but renders audio only).
     ".pinned-container.pinned-group-call",
-    ".chat-info .pinned-group-call",
-    ".chat-utils .is-live",
+    ".pinned-container.pinned-call",
 ]
+
+# The explicit Join control inside the live bar, when present.
+LIVE_JOIN_BUTTON = ".pinned-live-action-button"
 
 LIVE_TEXT_MARKERS = [
     "live stream",
@@ -172,6 +178,9 @@ PROBE_JS = """
 (() => {
     const selectors = __SELECTORS__;
     const markers = __MARKERS__;
+    // Scan only the active chat column: the sidebar previews service
+    // messages ("Live Stream started") that must not trigger detection.
+    const scope = document.querySelector('#column-center') || document.body;
     const visible = (el) => {
         const r = el.getBoundingClientRect();
         if (r.width < 10 || r.height < 10) return false;
@@ -186,15 +195,15 @@ PROBE_JS = """
     };
     for (const sel of selectors) {
         try {
-            for (const el of document.querySelectorAll(sel)) {
+            for (const el of scope.querySelectorAll(sel)) {
                 if (visible(el)) return mark(el, el.innerText.split('\\n')[0]);
             }
         } catch (e) { /* bad selector after UI churn - fall through */ }
     }
-    // Text fallback: any visible element near the top of the viewport whose
-    // own text matches a live marker.
+    // Text fallback: any visible element near the top of the chat column
+    // whose own text matches a live marker.
     const lower = markers.map(m => m.toLowerCase());
-    const all = document.body.querySelectorAll('div,section,button,span');
+    const all = scope.querySelectorAll('div,section,button,span');
     for (const el of all) {
         const r = el.getBoundingClientRect();
         if (r.top > 250 || !visible(el)) continue;
@@ -203,7 +212,7 @@ PROBE_JS = """
         if (lower.some(m => text.includes(m))) {
             // Prefer a clickable ancestor if the match is a bare label.
             let target = el;
-            for (let up = el; up && up !== document.body; up = up.parentElement) {
+            for (let up = el; up && up !== scope; up = up.parentElement) {
                 const cls = up.className || '';
                 if (typeof cls === 'string' &&
                     (cls.includes('pinned') || up.tagName === 'BUTTON')) {
@@ -221,10 +230,14 @@ PROBE_JS = """
 
 CLICK_LIVE_BAR_JS = """
 (() => {
+    // Prefer the live bar's explicit Join control; fall back to clicking
+    // the marked bar itself.
+    const btn = document.querySelector('__JOIN_BUTTON__');
+    if (btn && btn.getBoundingClientRect().width > 0) { btn.click(); return; }
     const el = document.querySelector('[data-tgstream-live]');
     if (el) el.click();
 })()
-"""
+""".replace("__JOIN_BUTTON__", LIVE_JOIN_BUTTON)
 
 CLICK_JOIN_JS = """
 (() => {
@@ -985,8 +998,12 @@ class Capture:
                 if state == "needs-login":
                     log("Login complete - session saved in /state/profile")
                     STATE.clear_login()
-                    self.browser.navigate(self.channel_url())
-                    time.sleep(3)
+                    # The SPA ignores runtime hash navigation (and rewrites
+                    # the hash back), so a fresh boot with the channel URL is
+                    # the only reliable way to open the chat.
+                    self.browser.close()
+                    self.browser.launch(self.channel_url())
+                    time.sleep(5)
                 STATE.set(state="idle")
                 return
             if state == "starting":
