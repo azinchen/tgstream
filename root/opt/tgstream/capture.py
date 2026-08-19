@@ -704,7 +704,10 @@ class Ffmpeg:
                 "-g", gop,
             ]
         cmd += [
-            "-af", "aresample=async=1",
+            # min_hard_comp keeps async correction to rare hard jumps -
+            # continuous micro-adjustment creates backward DTS steps that
+            # make MediaMTX drop readers/recorder.
+            "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0",
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
             "-f", "flv", PUBLISH_URL,
         ]
