@@ -15,6 +15,12 @@ OUT="/run/guide"
 REFRESH="${GUIDE_REFRESH:-10}"
 TIMEOUT="${FETCH_TIMEOUT:-3}"
 
+# HDHomeRun emulation (Plex has no native M3U tuner support): GUIDE_URL is
+# the URL by which Plex reaches this container - it is baked into
+# discover.json as BaseURL, so it must stay valid across restarts.
+GUIDE_URL="${GUIDE_URL:-http://tgstream-guide:${HTTP_PORT:-8409}}"
+TUNER_COUNT="${TUNER_COUNT:-2}"
+
 mkdir -p "$OUT/tmp"
 
 if [ -z "${UPSTREAMS:-}" ]; then
@@ -111,6 +117,35 @@ while true; do
 
     build_epg "$OUT/status" > "$OUT/epg.xml.new"
     mv "$OUT/epg.xml.new" "$OUT/epg.xml"
+
+    # HDHomeRun emulation for Plex: discover.json / lineup_status.json /
+    # lineup.json. Plex is pointed at this container's address in the
+    # "HDHomeRun device address" field and treats us as a network tuner;
+    # each lineup entry streams the channel's HLS URL from MediaMTX.
+    jq -n --arg base "$GUIDE_URL" --argjson tuners "$TUNER_COUNT" '{
+        FriendlyName: "tgstream",
+        Manufacturer: "Silicondust",
+        ModelNumber: "HDTC-2US",
+        FirmwareName: "hdhomeruntc_atsc",
+        FirmwareVersion: "20150826",
+        TunerCount: $tuners,
+        DeviceID: "74677331",
+        DeviceAuth: "tgstream",
+        BaseURL: $base,
+        LineupURL: ($base + "/lineup.json")
+    }' > "$OUT/discover.json.new"
+    mv "$OUT/discover.json.new" "$OUT/discover.json"
+
+    printf '{"ScanInProgress":0,"ScanPossible":1,"Source":"Cable","SourceList":["Cable"]}' \
+        > "$OUT/lineup_status.json.new"
+    mv "$OUT/lineup_status.json.new" "$OUT/lineup_status.json"
+
+    jq '[.[] | {
+        GuideNumber: (.channel_number | tostring),
+        GuideName: .name,
+        URL: .url
+    }]' "$OUT/status" > "$OUT/lineup.json.new"
+    mv "$OUT/lineup.json.new" "$OUT/lineup.json"
 
     sleep "$REFRESH"
 done

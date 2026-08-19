@@ -98,10 +98,23 @@ curl http://<PUBLIC_HOST>:8409/status               # channel states
 
 ### 4. Wire Plex / Jellyfin
 
-Live TV (both servers, same idea):
+**Plex** has no native M3U tuner support, so the guide emulates an HDHomeRun
+network tuner (`/discover.json`, `/lineup.json`):
 
-- Tuner / M3U URL: `http://<PUBLIC_HOST>:8409/playlist.m3u`
-- EPG / XMLTV URL: `http://<PUBLIC_HOST>:8409/epg.xml`
+1. Settings → Live TV & DVR → Set Up Plex Tuner. No tuner is auto-found;
+   click **"Don't see your HDHomeRun device? Enter its network address
+   manually"** and enter `<PUBLIC_HOST>:8409` — Plex discovers a
+   "tgstream" tuner.
+2. On the guide step choose **XMLTV** and enter
+   `http://<PUBLIC_HOST>:8409/epg.xml`, then confirm the channel mapping.
+
+The guide's `GUIDE_URL` env must be the URL by which *Plex* reaches the
+guide container (default `http://tgstream-guide:8409`, right for the bundled
+compose); `TUNER_COUNT` (default `2`) caps concurrent Plex streams.
+
+**Jellyfin** ingests M3U directly: Dashboard → Live TV → add an **M3U
+Tuner** with `http://<PUBLIC_HOST>:8409/playlist.m3u` and an **XMLTV**
+guide with `http://<PUBLIC_HOST>:8409/epg.xml`.
 
 Pair the tuner while only the slate is live — if the slate tunes and plays,
 the live stream will.
