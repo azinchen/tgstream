@@ -398,6 +398,15 @@ STAGE_VIDEO_JS = """
     v.muted = false;
     v.volume = 1.0;
     v.controls = false;
+    // Telegram live streams are rewindable and the player opens at the
+    // buffer position, not the live edge - which can be hours behind.
+    // Seek to the live edge; the 15s guard re-seeks only on real lag.
+    try {
+        if (v.seekable && v.seekable.length) {
+            const edge = v.seekable.end(v.seekable.length - 1);
+            if (edge - v.currentTime > 15) v.currentTime = Math.max(0, edge - 2);
+        }
+    } catch (e) {}
     v.play().catch(() => {});
     return true;
 })()
