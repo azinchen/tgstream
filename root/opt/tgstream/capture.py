@@ -792,8 +792,10 @@ class Capture:
                 r = await self.client(functions.phone.CheckGroupCallRequest(
                     call=call, sources=[JOIN_SSRC]))
                 if JOIN_SSRC not in r:
+                    log("keepalive: ssrc gone, re-joining")
                     await self.join(call)
-            except RPCError:
+            except RPCError as e:
+                log(f"keepalive: {type(e).__name__}, re-joining")
                 try:
                     await self.join(call)
                 except RPCError:
@@ -834,11 +836,13 @@ class Capture:
                 t = ((ch.channels[0].last_timestamp_ms // seg) * seg
                      - CFG["buffer_ms"])
                 big = 0
+                errs = 0
                 refetch = False
                 while not ended["v"] and not refetch:
                     status, data = await self.fetch(state["call"], t, scale)
                     if status == "ok":
                         big = 0
+                        errs = 0
                         await queue.put(data)
                         t += seg
                     elif status == "big":
@@ -856,7 +860,11 @@ class Capture:
                     elif status == "rejoin":
                         log("RECONNECT: presence/call rotated, continuing live")
                         # Presence dropped or call rotated: re-resolve and
-                        # continue live (a discontinuity, not a slate gap).
+                        # carry on. The output timeline (HLS.off) is already
+                        # continuous across the rejoin, so no discontinuity
+                        # marker - tagging one made players re-baseline and
+                        # visibly glitch. Discontinuities are only for
+                        # slate<->live switches.
                         if (c := await self.live_call()) is None:
                             ended["v"] = True
                             break
@@ -865,11 +873,23 @@ class Capture:
                             await self.join(c)
                         except RPCError:
                             pass
-                        HLS.reset_offset()
                         refetch = True
                     else:
-                        log(f"getFile: {data}")
-                        await asyncio.sleep(0.5)
+                        errs += 1
+                        if errs <= 2 or errs % 40 == 0:
+                            log(f"getFile: {data} (x{errs})")
+                        if "VIDEO_CHANNEL_INVALID" in (data or "") \
+                                and errs >= 3:
+                            # Source paused its video / changed stream params.
+                            # Re-resolve the stream channels and re-seek to
+                            # the live edge instead of hammering the same
+                            # timestamp forever (which froze the output for
+                            # the whole outage).
+                            log("VIDEO-PAUSE: re-resolving stream channels")
+                            await asyncio.sleep(1)
+                            refetch = True
+                        else:
+                            await asyncio.sleep(0.5)
             ended["v"] = True
             await queue.put(None)
 
