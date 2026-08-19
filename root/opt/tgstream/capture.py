@@ -628,6 +628,39 @@ class Capture:
               f"(or open {login} )\n\n{qr}\n"
               f"Code rotates ~every 30s.\n", flush=True)
 
+    async def resolve_peer(self):
+        peer = CFG["peer"].strip()
+        if peer.startswith("@") or "t.me/" in peer:
+            return await self.client.get_entity(peer)
+        # Numeric channel id. Telegram Web hashes it as "-<channel_id>";
+        # bot-API marks it "-100<channel_id>". Populate the entity cache
+        # (access_hash for private channels) then resolve.
+        await self.client.get_dialogs()
+        try:
+            n = int(peer)
+        except ValueError:
+            return await self.client.get_entity(peer)
+        for cand in self._id_candidates(n):
+            try:
+                return await self.client.get_entity(cand)
+            except (ValueError, RPCError):
+                continue
+        raise SystemExit(f"CRITICAL ERROR: cannot resolve TG_PEER '{peer}' - "
+                         "is the account a member of the channel?")
+
+    @staticmethod
+    def _id_candidates(n):
+        s = str(n)
+        cands = [n]
+        if s.startswith("-100"):
+            cands.append(types.PeerChannel(int(s[4:])))
+        elif n < 0:
+            cid = -n
+            cands += [types.PeerChannel(cid), int(f"-100{cid}")]
+        else:
+            cands += [types.PeerChannel(n), int(f"-100{n}")]
+        return cands
+
     async def live_call(self):
         full = await self.client(
             functions.channels.GetFullChannelRequest(channel=self.entity))
@@ -721,7 +754,7 @@ class Capture:
             CFG["api_id"], CFG["api_hash"])
         await self.client.connect()
         await self.qr_login()
-        self.entity = await self.client.get_entity(CFG["peer"])
+        self.entity = await self.resolve_peer()
 
         stop_slate = threading.Event()
         slate_thread = None
