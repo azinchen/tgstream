@@ -1,0 +1,12 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="SERVICE-CAPTURE"
+
+log "$SCRIPT_NAME" "Starting capture service for channel '${TG_SLUG:-unset}'"
+
+exec python3 /opt/tgstream/capture.py

@@ -1,0 +1,32 @@
+#!/bin/sh
+# shellcheck shell=sh
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="ENTRYPOINT"
+
+echo "=================================================================================="
+echo "🚀 tgstream - Telegram live streams to Plex/Jellyfin"
+echo "=================================================================================="
+echo "📋 Description: Capture Telegram channel live streams, restream as live TV, record to files"
+echo "👤 Author: Alexander Zinchenko <alexander@zinchenko.com>"
+echo "🏷️ Image Version: __IMAGE_VERSION__"
+echo "📅 Build Date: __BUILD_DATE__"
+echo "=================================================================================="
+
+# The s6 user bundle is assembled here so optional services (x11vnc) can be
+# toggled by env. contents.d lives in the writable container layer.
+rc="/etc/s6-overlay/s6-rc.d/user/contents.d"
+mkdir -p "$rc"
+rm -f "$rc"/*
+
+touch "$rc/init-tgstream" "$rc/svc-xvfb" "$rc/svc-pulseaudio" "$rc/svc-capture"
+
+if [ "$(echo "${DEBUG_VNC:-false}" | tr 'A-Z' 'a-z')" = "true" ]; then
+    log "$SCRIPT_NAME" "DEBUG_VNC enabled - browser exposed on port 5900"
+    touch "$rc/svc-x11vnc"
+fi
+
+exec /init "$@"

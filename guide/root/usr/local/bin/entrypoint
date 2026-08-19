@@ -1,0 +1,15 @@
+#!/bin/sh
+# shellcheck shell=sh
+
+set -eu
+
+echo "=================================================================================="
+echo "🚀 tgstream-guide - merged M3U + XMLTV for Plex/Jellyfin"
+echo "=================================================================================="
+echo "📋 Description: Aggregates tgstream capture containers into one tuner URL"
+echo "👤 Author: Alexander Zinchenko <alexander@zinchenko.com>"
+echo "🏷️ Image Version: __IMAGE_VERSION__"
+echo "📅 Build Date: __BUILD_DATE__"
+echo "=================================================================================="
+
+exec /init "$@"

@@ -1,0 +1,6 @@
+#!/bin/sh
+# shellcheck shell=sh
+
+set -eu
+
+curl -fsS -m 5 "http://127.0.0.1:${HTTP_PORT:-8409}/status" > /dev/null

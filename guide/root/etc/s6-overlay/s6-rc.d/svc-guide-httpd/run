@@ -1,0 +1,20 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="SERVICE-GUIDE-HTTPD"
+
+# Serve only after the first refresh has produced files, so early tuner
+# requests get real content instead of 404s.
+counter=0
+while [ ! -f /run/guide/status ] && [ "$counter" -lt 300 ]; do
+    counter=$((counter + 1))
+    sleep 0.2
+done
+
+log "$SCRIPT_NAME" "Serving merged guide on port ${HTTP_PORT:-8409}"
+
+exec busybox-extras httpd -f -p "${HTTP_PORT:-8409}" -h /run/guide -c /etc/httpd.conf

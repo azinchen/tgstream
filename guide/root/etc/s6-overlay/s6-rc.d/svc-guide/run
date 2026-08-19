@@ -1,0 +1,116 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Guide refresh loop: poll every capture container's /status in parallel,
+# regenerate the merged playlist/EPG/status as static files in /run/guide.
+# svc-guide-httpd serves them. Unreachable upstreams are skipped so one dead
+# capture container degrades the playlist instead of erroring every tuner.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="SERVICE-GUIDE"
+
+OUT="/run/guide"
+REFRESH="${GUIDE_REFRESH:-10}"
+TIMEOUT="${FETCH_TIMEOUT:-3}"
+
+mkdir -p "$OUT/tmp"
+
+if [ -z "${UPSTREAMS:-}" ]; then
+    log_warning "$SCRIPT_NAME" "UPSTREAMS is empty - playlist and guide will be empty"
+fi
+
+log "$SCRIPT_NAME" "Aggregating upstreams every ${REFRESH}s: ${UPSTREAMS:-<none>}"
+
+xml_escape()
+{
+    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+# busybox date: @epoch input, formatted in UTC.
+xmltv_time()
+{
+    printf '%s +0000' "$(date -u -d "@$1" +%Y%m%d%H%M%S)"
+}
+
+build_epg()
+{
+    status_file="$1"
+    now="$(date +%s)"
+    hour="$((now - now % 3600))"
+
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<tv generator-info-name="tgstream-guide">\n'
+
+    # XMLTV requires all <channel> elements before any <programme>.
+    jq -r '.[] | [.slug, .name] | @tsv' "$status_file" \
+    | while IFS="$(printf '\t')" read -r slug name; do
+        printf '  <channel id="%s">\n' "$slug"
+        printf '    <display-name>%s</display-name>\n' \
+            "$(printf '%s' "$name" | xml_escape)"
+        printf '  </channel>\n'
+    done
+
+    jq -r '.[] | [.slug, .name, .state, (.title // ""), (.since_ts // 0 | floor)] | @tsv' \
+        "$status_file" \
+    | while IFS="$(printf '\t')" read -r slug name state title since_ts; do
+        if [ "$state" = "live" ]; then
+            [ -n "$title" ] || title="$name live"
+            printf '  <programme start="%s" stop="%s" channel="%s">\n' \
+                "$(xmltv_time "$since_ts")" \
+                "$(xmltv_time "$((now + 4 * 3600))")" "$slug"
+            printf '    <title>%s</title>\n' \
+                "$(printf '%s' "$title" | xml_escape)"
+            printf '  </programme>\n'
+        else
+            # Plex refuses channels without guide data - fill hour blocks.
+            i=0
+            while [ "$i" -lt 12 ]; do
+                printf '  <programme start="%s" stop="%s" channel="%s">\n' \
+                    "$(xmltv_time "$((hour + i * 3600))")" \
+                    "$(xmltv_time "$((hour + (i + 1) * 3600))")" "$slug"
+                printf '    <title>%s (no stream)</title>\n' \
+                    "$(printf '%s' "$name" | xml_escape)"
+                printf '  </programme>\n'
+                i=$((i + 1))
+            done
+        fi
+    done
+
+    printf '</tv>\n'
+}
+
+while true; do
+    rm -f "$OUT"/tmp/*.json
+
+    i=0
+    oldIFS="$IFS"; IFS=','
+    for upstream in ${UPSTREAMS:-}; do
+        IFS="$oldIFS"
+        upstream="$(trim "$upstream")"
+        [ -n "$upstream" ] || continue
+        i=$((i + 1))
+        curl -fsS -m "$TIMEOUT" "${upstream%/}/status" \
+            -o "$OUT/tmp/$i.json" 2>/dev/null &
+    done
+    IFS="$oldIFS"
+    wait
+
+    # -e fails on invalid/missing input; then fall back to an empty list.
+    jq -s -e 'sort_by(.channel_number)' "$OUT"/tmp/*.json \
+        > "$OUT/status.new" 2>/dev/null || printf '[]' > "$OUT/status.new"
+    mv "$OUT/status.new" "$OUT/status"
+
+    {
+        printf '#EXTM3U\n'
+        jq -r '.[] | "#EXTINF:-1 tvg-id=\"\(.slug)\" tvg-name=\"\(.name)\" tvg-chno=\"\(.channel_number)\" group-title=\"Telegram\",\(.name)\n\(.url)"' \
+            "$OUT/status"
+    } > "$OUT/playlist.m3u.new"
+    mv "$OUT/playlist.m3u.new" "$OUT/playlist.m3u"
+
+    build_epg "$OUT/status" > "$OUT/epg.xml.new"
+    mv "$OUT/epg.xml.new" "$OUT/epg.xml"
+
+    sleep "$REFRESH"
+done

@@ -1,0 +1,38 @@
+# MediaMTX configuration for tgstream. Only overrides are listed; everything
+# else keeps the image defaults.
+
+logLevel: info
+
+# Unused protocols off.
+rtsp: no
+webrtc: no
+srt: no
+api: no
+metrics: no
+playback: no
+
+# Capture containers publish here.
+rtmp: yes
+rtmpAddress: :1935
+
+# Plex and Jellyfin tune this.
+hls: yes
+hlsAddress: :8888
+hlsVariant: mpegts
+hlsSegmentCount: 7
+hlsSegmentDuration: 2s
+
+pathDefaults:
+  # Record continuously, slate included: no runtime record-toggling, and slate
+  # segments are tiny and expire on their own. MPEG-TS specifically because a
+  # segment truncated by an unclean kill still concatenates; fMP4 does not.
+  record: yes
+  recordPath: /segments/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: mpegts
+  # Keep in sync with RECORD_SEGMENT_SECONDS (600) in the capture containers.
+  recordSegmentDuration: 10m
+  recordDeleteAfter: 24h
+
+paths:
+  "~^tg-.+$":
+    source: publisher

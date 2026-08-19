@@ -1,0 +1,21 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="SERVICE-X11VNC"
+
+log "$SCRIPT_NAME" "Exposing ${DISPLAY} via VNC on port 5900"
+
+# Xvfb may not accept connections the instant s6 starts us; x11vnc exits on
+# failure and s6 restarts it, so a short pre-wait keeps the log quiet.
+display_socket="/tmp/.X11-unix/X${DISPLAY#:}"
+counter=0
+while [ ! -S "$display_socket" ] && [ "$counter" -lt 50 ]; do
+    counter=$((counter + 1))
+    sleep 0.2
+done
+
+exec x11vnc -display "${DISPLAY}" -forever -shared -nopw -quiet -rfbport 5900

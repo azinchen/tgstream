@@ -1,0 +1,83 @@
+# tgstream - Telegram live streams to Plex/Jellyfin.
+#
+# One capture container per channel. To add a channel: copy the tg-main block,
+# change slug/peer/name/number, the /state volume and the login port mapping
+# (e.g. 8411:8409 + PUBLIC_HTTP_PORT=8411), then append the new container's
+# URL to the guide's UPSTREAMS. Each channel logs in once via its own QR.
+#
+# Host paths and PUBLIC_HOST come from .env (see .env.example).
+
+x-capture: &capture
+  image: ghcr.io/azinchen/tgstream:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  # Chromium crashes tabs on the default 64MB /dev/shm.
+  shm_size: 1gb
+  depends_on:
+    - mediamtx
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: tgstream-mediamtx
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - ./config/mediamtx.yml:/mediamtx.yml:ro
+      - ${APPDATA_DIR}/segments:/segments
+    ports:
+      # HLS - must be reachable from Plex, Jellyfin AND playback clients.
+      - "8888:8888"
+
+  tg-main:
+    <<: *capture
+    container_name: tg-main
+    environment:
+      - TZ=${TZ}
+      - TG_SLUG=main
+      - TG_PEER=${TG_PEER}
+      - TG_NAME=${TG_NAME:-Telegram Main}
+      - TG_CHANNEL_NUMBER=1
+      - PUBLIC_HOST=${PUBLIC_HOST}
+      - PUBLIC_HTTP_PORT=8410     # must match the ports: mapping below
+      # - CAPTURE_ENCODER=vaapi   # GPU encode; needs the devices: block below
+      # - VAAPI_DEVICE=/dev/dri/renderD129  # only if the render node isn't renderD128
+      # - DEBUG_VNC=true          # expose the browser on 5900 for debugging
+    volumes:
+      - ${APPDATA_DIR}/state/main:/state
+      - ${APPDATA_DIR}/segments:/segments
+      - ${LIBRARY_DIR}:/library
+    ports:
+      # First start only: open http://<host>:8410/login and scan the QR with
+      # the Telegram app (also printed to `docker logs tg-main`). The session
+      # then persists in the /state volume.
+      - "8410:8409"
+    # ports:
+    #   - "5900:5900"             # only with DEBUG_VNC=true
+    # devices:
+    #   - /dev/dri:/dev/dri       # only with CAPTURE_ENCODER=vaapi
+
+  guide:
+    image: ghcr.io/azinchen/tgstream-guide:latest
+    build:
+      context: ./guide
+      dockerfile: Dockerfile
+    container_name: tgstream-guide
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - UPSTREAMS=http://tg-main:8409
+    ports:
+      # Plex/Jellyfin tuner + guide URL: http://<host>:8409/playlist.m3u
+      - "8409:8409"
+
+# To expose HLS/guide through an existing reverse proxy instead of host
+# ports, attach mediamtx and guide to the external network:
+#
+# networks:
+#   default:
+#   reverseproxynetwork:
+#     external: true

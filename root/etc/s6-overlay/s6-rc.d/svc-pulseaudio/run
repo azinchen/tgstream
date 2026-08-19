@@ -1,0 +1,25 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="SERVICE-PULSEAUDIO"
+
+mkdir -p "${PULSE_RUNTIME_PATH:-/run/pulse}"
+
+log "$SCRIPT_NAME" "Starting PulseAudio with null sink 'tgcap'"
+
+# -n skips default.pa: only the modules below are loaded. Chromium plays the
+# stream into the null sink; ffmpeg records from its monitor source
+# (tgcap.monitor). auth-anonymous avoids per-user cookie plumbing under s6.
+exec pulseaudio \
+    --daemonize=no \
+    --exit-idle-time=-1 \
+    --disallow-exit \
+    --disable-shm=yes \
+    -n \
+    -L "module-native-protocol-unix socket=${PULSE_RUNTIME_PATH:-/run/pulse}/native auth-anonymous=1" \
+    -L "module-null-sink sink_name=tgcap sink_properties=device.description=tgcap" \
+    -L "module-always-sink"

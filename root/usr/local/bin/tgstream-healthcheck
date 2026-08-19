@@ -1,0 +1,18 @@
+#!/bin/sh
+# shellcheck shell=sh
+# Healthy while /status answers, except when the container has been sitting
+# in needs-login for over 10 minutes - that needs a human with a phone, and
+# an unhealthy flag in `docker ps` is the signal.
+
+set -eu
+
+status="$(curl -fsS -m 5 "http://127.0.0.1:${HTTP_PORT:-8409}/status")"
+
+echo "$status" | python3 -c '
+import json, sys, time
+s = json.load(sys.stdin)
+if s.get("state") == "needs-login":
+    since = s.get("since_ts") or 0
+    if time.time() - since > 600:
+        raise SystemExit("needs-login for over 10 minutes")
+'

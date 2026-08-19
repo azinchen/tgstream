@@ -1,0 +1,94 @@
+name: "🔒 Code & Filesystem Security Scan"
+
+permissions:
+  contents: read
+  security-events: write  # Required for uploading SARIF to the Security tab
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 4 * * 1'  # Weekly, Mondays at 4 AM UTC
+  workflow_dispatch:
+
+jobs:
+  code-fs-security:
+    name: 🔒 Code & Filesystem Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      # ============================================================================
+      # LINT / SHELL & DOCKERFILE STATIC ANALYSIS (shellcheck, hadolint, ...)
+      # ============================================================================
+      - name: Run Super-Linter
+        id: super-linter
+        uses: super-linter/super-linter@v8.7.0
+        continue-on-error: true
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_DOCKERFILE_HADOLINT: true
+          VALIDATE_BASH: true
+          VALIDATE_SHELL_SHFMT: true
+          VALIDATE_MARKDOWN: true
+          VALIDATE_JSON: true
+          VALIDATE_YAML: true
+          # capture.py; jsQR.js is vendored third-party code, don't lint it
+          VALIDATE_PYTHON_FLAKE8: true
+          FILTER_REGEX_EXCLUDE: '.*jsQR\.js'
+
+      # ============================================================================
+      # TRIVY VULNERABILITY + MISCONFIGURATION SCANNING
+      # ============================================================================
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+
+      - name: Upload Trivy filesystem results to Security tab
+        uses: github/codeql-action/upload-sarif@v4.37.6
+        if: always() && hashFiles('trivy-fs-results.sarif') != ''
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+          category: 'trivy-filesystem'
+
+      - name: Run Trivy config/Dockerfile scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-config-results.sarif'
+
+      - name: Upload Trivy config results to Security tab
+        uses: github/codeql-action/upload-sarif@v4.37.6
+        if: always() && hashFiles('trivy-config-results.sarif') != ''
+        with:
+          sarif_file: 'trivy-config-results.sarif'
+          category: 'trivy-config'
+
+      # ============================================================================
+      # WORKFLOW SUMMARY
+      # ============================================================================
+      - name: Create workflow summary
+        if: always()
+        run: |
+          {
+            echo "## 🔒 Code & Filesystem Security Scan"
+            echo ""
+            echo "| Component | Status |"
+            echo "|-----------|--------|"
+            echo "| 🧹 Super-Linter (shellcheck, hadolint, flake8) | ${{ steps.super-linter.outcome }} |"
+            echo "| 🛡️ Trivy filesystem | $( [ -f trivy-fs-results.sarif ] && echo '✅ completed' || echo '❌ no results' ) |"
+            echo "| 🔧 Trivy config/Dockerfile | $( [ -f trivy-config-results.sarif ] && echo '✅ completed' || echo '❌ no results' ) |"
+            echo ""
+            echo "Findings are published to the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)."
+          } >> "$GITHUB_STEP_SUMMARY"
