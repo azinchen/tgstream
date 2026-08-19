@@ -320,17 +320,27 @@ QR_MIRROR_JS = """
 })()
 """
 
-# Selector-free video handling: find the largest loaded <video> (K's stream
-# player opens PAUSED - readyState 4 but paused:true - so paused videos
-# count), reparent it into a full-viewport stage and start playback.
+# Selector-free video handling: pick the best loaded <video>, reparent it
+# into a full-viewport stage and start playback. K's stream player opens
+# PAUSED (readyState 4, paused:true), so paused videos count. Scoring:
+# the player's main video carries the media-video class; square videos are
+# circular participant/preview thumbnails and must lose to the real stream.
+# Idempotent and re-entrant: called every live tick, so when the main video
+# loads late it evicts a provisionally staged thumbnail.
 STAGE_VIDEO_JS = """
 (() => {
     const loaded = [...document.querySelectorAll('video')].filter(v => {
         return v.readyState >= 2 && v.videoWidth > 0;
     });
     if (!loaded.length) return false;
-    loaded.sort((a, b) =>
-        (b.videoWidth * b.videoHeight) - (a.videoWidth * a.videoHeight));
+    const score = (v) => {
+        let s = v.videoWidth * v.videoHeight;
+        const cls = (v.className || '').toString();
+        if (cls.includes('media-video')) s += 100000000;
+        if (v.videoWidth === v.videoHeight) s -= 50000000;
+        return s;
+    };
+    loaded.sort((a, b) => score(b) - score(a));
     const v = loaded[0];
     let stage = document.getElementById('tgstream-stage');
     if (!stage) {
@@ -341,7 +351,14 @@ STAGE_VIDEO_JS = """
             'display:flex;align-items:center;justify-content:center;cursor:none;';
         document.body.appendChild(stage);
     }
-    if (v.parentElement !== stage) stage.appendChild(v);
+    if (v.parentElement !== stage) {
+        // Evict a previously staged (lesser) video; keep it alive but hidden.
+        for (const old of [...stage.children]) {
+            old.style.cssText = 'display:none;';
+            document.body.appendChild(old);
+        }
+        stage.appendChild(v);
+    }
     v.style.cssText = 'width:100vw;height:100vh;object-fit:contain;cursor:none;';
     v.muted = false;
     v.volume = 1.0;
@@ -1078,6 +1095,12 @@ class Capture:
         if state == "live":
             self.ffmpeg.ensure("live")
             now = time.monotonic()
+            # Re-stage every tick: idempotent, and upgrades to the player's
+            # main video if a thumbnail was staged before it finished loading.
+            try:
+                self.browser.evaluate(STAGE_VIDEO_JS)
+            except BrowserError:
+                pass
             if self.video_advancing():
                 self.last_video_ok = now
                 return
