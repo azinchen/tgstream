@@ -16,12 +16,14 @@ import html
 import json
 import os
 import re
+import io
 import struct
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import av
 from telethon import TelegramClient, functions, types
 from telethon.errors import RPCError, SessionPasswordNeededError
 
@@ -183,15 +185,33 @@ class Hls:
         out_ts = os.path.join(HLS_DIR, f"s{idx}.ts")
         part = out_ts + ".part"
         dur = audio_duration(mp4_bytes)
-        tmp_mp4 = os.path.join(HLS_DIR, "cur.mp4")
-        with open(tmp_mp4, "wb") as f:
-            f.write(mp4_bytes)
-        # -c copy both streams, shift onto the running gapless timeline.
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-             "-i", tmp_mp4, "-c", "copy", "-muxdelay", "0", "-muxpreload", "0",
-             "-output_ts_offset", f"{self.off:.3f}", "-f", "mpegts", part],
-            check=False)
+        # In-process packet remux (PyAV): copy the already-encoded H.264/AAC
+        # packets onto the running gapless timeline. This produces
+        # player-clean MPEG-TS - the ffmpeg-CLI -c copy path left VLC/Plex
+        # without audio.
+        try:
+            inp = av.open(io.BytesIO(mp4_bytes), mode="r")
+            out = av.open(part, mode="w", format="mpegts")
+            omap = {}
+            for s in inp.streams:
+                if s.type in ("video", "audio"):
+                    try:
+                        omap[s.index] = out.add_stream_from_template(s)
+                    except AttributeError:
+                        omap[s.index] = out.add_stream(template=s)
+            for pkt in inp.demux():
+                if pkt.dts is None or pkt.stream.index not in omap:
+                    continue
+                off = int(round(self.off / float(pkt.time_base)))
+                pkt.pts = (pkt.pts or 0) + off
+                pkt.dts = pkt.dts + off
+                pkt.stream = omap[pkt.stream.index]
+                out.mux(pkt)
+            out.close()
+            inp.close()
+        except Exception as exc:  # noqa: BLE001
+            STATE.set(error=f"remux: {exc}")
+            return dur
         try:
             os.replace(part, out_ts)
         except OSError:

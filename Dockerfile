@@ -84,8 +84,12 @@ RUN echo "**** install mandatory packages ****" && \
         python3=3.14.7-r1 \
         tzdata=2026c-r0 \
         && \
+    echo "**** install PyAV (in-process remux; abi3 musllinux wheel) ****" && \
+    apk --no-cache --no-progress add --virtual .pip py3-pip && \
+    pip install --break-system-packages --no-cache-dir av==18.1.0 && \
+    apk del .pip && \
     echo "**** cleanup ****" && \
-    rm -rf /tmp/* /var/cache/apk/*
+    rm -rf /tmp/* /var/cache/apk/* /root/.cache
 
 COPY --from=rootfs-builder /rootfs/ /
 

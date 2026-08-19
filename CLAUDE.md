@@ -21,13 +21,15 @@ source quality, true live edge, and structural A/V sync. See §3.1.
 
 Implementation conventions: **Alpine** base with **pinned apk versions**,
 s6-overlay v3 supervised, following the layout and style of `~/projects/
-nordvpn`. **No pip** (user directive): `py3-telethon` from apk, `ffmpeg` CLI
-for remux/slate/harvest (PyAV ships musllinux wheels and works on Alpine, but
-would need pip, so it is deliberately avoided — the audio-duration parse that
-PyAV made easy is a ~30-line pure-Python MP4 box scanner in `capture.py`).
-Guide is pure shell (`curl` + `jq` + busybox httpd). `capture.py` is Python:
-it runs the Telethon async client, the download pipeline, and the state
-machine. No Claude/Anthropic attribution in commits or PRs.
+nordvpn`. Mostly apk, no pip — **one deliberate exception**: `av` (PyAV) is
+`pip install`ed (abi3 musllinux wheel, no compile) because the ffmpeg-CLI
+`-c copy` remux left VLC and Plex with no audio, while PyAV's in-process
+packet remux produces player-clean MPEG-TS. Everything else is apk:
+`py3-telethon`, `ffmpeg` (slate/harvest), `libqrencode-tools`. The
+audio-duration used for the gapless timeline is still a ~30-line pure-Python
+MP4 box scanner in `capture.py` (advance the offset by the chunk's real
+~1003ms audio, not a fixed 1000ms grid). Guide is pure shell (`curl` + `jq` +
+busybox httpd). No Claude/Anthropic attribution in commits or PRs.
 
 ---
 
