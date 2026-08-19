@@ -98,7 +98,7 @@ the live stream will.
 
 Recordings: add `LIBRARY_DIR` as a **TV Shows** library (date-based episode
 ordering in Plex). Files are named
-`<Name>/<Name> - YYYY-MM-DD - <Stream Title>.mp4`.
+`<Name> - YYYY-MM-DD - <Stream Title>.mp4` directly in `LIBRARY_DIR`.
 
 ### Watch directly (VLC, etc.)
 
@@ -116,8 +116,8 @@ ordering in Plex). Files are named
 3. `docker compose up -d`, then scan the new container's QR once
    (`docker logs -f tg-<slug>`).
 
-`TG_SLUG` becomes the library folder name — changing it later orphans
-existing recordings.
+`TG_SLUG` is the stream path and session key — changing it later starts a
+fresh channel (new QR login).
 
 ## Capture container reference
 

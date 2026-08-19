@@ -316,7 +316,7 @@ shared segment volume. Each capture container owns its MTProto session in
 ### 5.4 Recording output
 
 ```
-/tank/media/telegram/<TG_NAME>/<TG_NAME> - YYYY-MM-DD - <Stream Title>.mp4
+/tank/media/telegram/<TG_NAME> - YYYY-MM-DD - <Stream Title>.mp4
 ```
 
 Added to Plex and Jellyfin as a **TV Shows** library, date-based episode

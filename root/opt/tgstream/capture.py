@@ -337,7 +337,9 @@ class Recorder:
     def _harvest(self, title, start_ts, ts_file):
         try:
             date = datetime.datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d")
-            out_dir = os.path.join(CFG["library_dir"], CFG["name"])
+            # Write straight into /library (no per-channel subfolder); mount a
+            # subfolder as /library if per-channel separation is wanted.
+            out_dir = CFG["library_dir"]
             os.makedirs(out_dir, exist_ok=True)
             base = f"{CFG['name']} - {date} - {sanitize_title(title)}"
             out = os.path.join(out_dir, f"{base}.mp4")
