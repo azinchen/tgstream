@@ -23,6 +23,12 @@ TUNER_COUNT="${TUNER_COUNT:-2}"
 
 mkdir -p "$OUT/tmp"
 
+# Plex's HDHomeRun client needs raw MPEG-TS: /cgi-bin/stream remuxes the
+# channel's RTMP feed on the fly (busybox httpd runs CGI from cgi-bin/).
+mkdir -p "$OUT/cgi-bin"
+cp /usr/local/bin/stream-cgi "$OUT/cgi-bin/stream"
+chmod +x "$OUT/cgi-bin/stream"
+
 if [ -z "${UPSTREAMS:-}" ]; then
     log_warning "$SCRIPT_NAME" "UPSTREAMS is empty - playlist and guide will be empty"
 fi
@@ -140,10 +146,12 @@ while true; do
         > "$OUT/lineup_status.json.new"
     mv "$OUT/lineup_status.json.new" "$OUT/lineup_status.json"
 
-    jq '[.[] | {
+    # Plex tunes lineup URLs expecting raw MPEG-TS, not HLS - point them at
+    # the CGI remux (the M3U playlist keeps HLS for Jellyfin/VLC).
+    jq --arg base "$GUIDE_URL" '[.[] | {
         GuideNumber: (.channel_number | tostring),
         GuideName: .name,
-        URL: .url
+        URL: ($base + "/cgi-bin/stream?path=" + .path)
     }]' "$OUT/status" > "$OUT/lineup.json.new"
     mv "$OUT/lineup.json.new" "$OUT/lineup.json"
 

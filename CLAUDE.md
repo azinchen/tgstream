@@ -169,9 +169,13 @@ baked into discover.json as BaseURL). Plex is pointed at the guide's
 address in the HDHomeRun field; Jellyfin keeps using the M3U. Threadfin
 still stays out — it only earns its keep filtering thousand-channel lists.
 
-Known risk, test on first tune: Plex's HDHomeRun client classically expects
-raw MPEG-TS from lineup URLs; ours serve MediaMTX HLS. If Plex refuses,
-fallback is a copy-remux CGI in the guide (ffmpeg -c copy -f mpegts).
+Confirmed on first tune: Plex's HDHomeRun client requires raw MPEG-TS from
+lineup URLs and refuses HLS ("Could not tune channel"). Resolved: the guide
+ships ffmpeg and a `/cgi-bin/stream?path=tg-<slug>` CGI that copy-remuxes
+the channel's RTMP feed from MediaMTX to MPEG-TS on the fly (no re-encode);
+lineup.json points there, while playlist.m3u keeps HLS URLs for
+Jellyfin/VLC. `STREAM_SOURCE_BASE` (default `rtmp://tgstream-mediamtx:1935`)
+names the RTMP source.
 
 ### 3.6 Guide aggregation — DECIDED
 

@@ -68,6 +68,7 @@ RUN echo "**** install mandatory packages ****" && \
     apk --no-cache --no-progress add \
         busybox-extras=1.37.0-r31 \
         curl=8.21.0-r0 \
+        ffmpeg=8.1.2-r0 \
         jq=1.8.1-r0 \
         tzdata=2026c-r0 \
         && \
