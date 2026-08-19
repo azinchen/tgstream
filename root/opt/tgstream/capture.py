@@ -648,22 +648,21 @@ class Ffmpeg:
                 "-c", "copy",
                 "-f", "flv", PUBLISH_URL,
             ]
-        # A/V sync: both inputs are stamped with the same wallclock so the
-        # muxer can align them; thread_queue_size stops queue starvation
-        # under encoder load (a classic drift source); small pulse fragments
-        # cut audio buffering latency. AUDIO_OFFSET shifts audio for any
-        # residual constant offset (positive = delay audio).
+        # A/V sync: thread_queue_size stops input-queue starvation under
+        # encoder load (a classic drift source); small pulse fragments cut
+        # audio buffering latency; aresample=async=1 absorbs residual drift.
+        # Do NOT wallclock-stamp the pulse input - its packet read times are
+        # jittery and async resampling then pads the jitter with silence.
+        # AUDIO_OFFSET shifts audio for any remaining constant offset.
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning",
             "-thread_queue_size", "1024",
-            "-use_wallclock_as_timestamps", "1",
             "-f", "x11grab",
             "-framerate", str(CFG["fps"]),
             "-video_size", f"{CFG['width']}x{CFG['height']}",
             "-draw_mouse", "0",
             "-i", CFG["display"],
             "-thread_queue_size", "1024",
-            "-use_wallclock_as_timestamps", "1",
         ]
         if CFG["audio_offset"] != 0.0:
             cmd += ["-itsoffset", str(CFG["audio_offset"])]
