@@ -240,11 +240,15 @@ CLICK_LIVE_BAR_JS = """
 """.replace("__JOIN_BUTTON__", LIVE_JOIN_BUTTON)
 
 # After joining an RTMP stream the in-call bar appears but the stream player
-# (and its <video>) only materializes when the bar is clicked open.
+# (and its <video>) only materializes when the bar is clicked open. The click
+# TOGGLES the player, so it must never fire while the player exists (even
+# one still loading) - the guard checks for player videos, not readiness.
 OPEN_PLAYER_JS = """
 (() => {
-    if ([...document.querySelectorAll('video')].some(v => v.readyState >= 2))
-        return 'player open';
+    const vids = [...document.querySelectorAll('video')];
+    if (vids.some(v => v.className.toString().includes('media-video')
+                       || v.readyState >= 1))
+        return 'player present';
     const c = document.querySelector('.topbar-call-center');
     if (!c) return 'no call bar';
     c.click();
@@ -252,11 +256,14 @@ OPEN_PLAYER_JS = """
 })()
 """
 
+# Confirm buttons inside popups only ("Join"/"Watch" dialogs) - a global
+# button sweep re-clicks the live bar's own Join and toggles the call.
 CLICK_JOIN_JS = """
 (() => {
     const texts = __TEXTS__;
     const lower = texts.map(t => t.toLowerCase());
-    const candidates = document.querySelectorAll('button, .btn-primary, [role="button"]');
+    const candidates = document.querySelectorAll(
+        '.popup button, .popup .btn-primary');
     for (const el of candidates) {
         const r = el.getBoundingClientRect();
         if (r.width < 5 || r.height < 5) continue;
@@ -958,18 +965,25 @@ class Capture:
             STATE.set(error=f"join click failed: {exc}")
             return False
 
-        deadline = time.monotonic() + CFG["join_timeout"]
+        start = time.monotonic()
+        deadline = start + CFG["join_timeout"]
+        last_open_click = 0.0
         while time.monotonic() < deadline:
             try:
-                # A confirm dialog ("Join"/"Watch") may pop; press it if seen.
-                self.browser.evaluate(CLICK_JOIN_JS)
-                # RTMP streams: joining shows the in-call bar, but the stream
-                # player with its <video> only opens on a bar click.
-                self.browser.evaluate(OPEN_PLAYER_JS)
                 if self.browser.evaluate(STAGE_VIDEO_JS):
                     self.last_clock = None
                     self.last_video_ok = time.monotonic()
                     return True
+                # A confirm dialog ("Join"/"Watch") may pop; press it if seen.
+                self.browser.evaluate(CLICK_JOIN_JS)
+                # RTMP streams: the stream player only opens on a call-bar
+                # click - and the click toggles, so give joining a few
+                # seconds first and retry sparingly while nothing loads.
+                now = time.monotonic()
+                if now - start > 4 and now - last_open_click > 12:
+                    result = self.browser.evaluate(OPEN_PLAYER_JS)
+                    if result == "clicked":
+                        last_open_click = now
             except BrowserError as exc:
                 STATE.set(error=f"join evaluate failed: {exc}")
                 return False
