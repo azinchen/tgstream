@@ -50,8 +50,8 @@ CFG = {
     "public_http_port": int(env("PUBLIC_HTTP_PORT", env("HTTP_PORT", "8409"))),
     "poll_interval": float(env("POLL_INTERVAL", "5")),
     "buffer_ms": int(env("BUFFER_MS", "2000")),
-    "window": int(env("HLS_WINDOW", "12")),
-    "grace": int(env("HLS_GRACE", "8")),
+    "window": int(env("HLS_WINDOW", "16")),
+    "grace": int(env("HLS_GRACE", "40")),
     "video_quality": int(env("VIDEO_QUALITY", "2")),
     "state_dir": env("STATE_DIR", "/state"),
     "library_dir": env("LIBRARY_DIR", "/library"),
@@ -277,9 +277,15 @@ HLS = Hls()
 # ---------------------------------------------------------------------------
 
 class Recorder:
+    """Append each segment's bytes to one growing MPEG-TS on disk (segments
+    share a continuous timeline, so byte-append concatenates cleanly), then
+    remux to mp4 on stream end. A single growing file - not 1000s of small
+    tmpfs files - so long streams don't pile up."""
+
     def __init__(self):
         self.active = False
-        self.files = []
+        self.fh = None
+        self.tmp_ts = None
         self.title = None
         self.start_ts = None
 
@@ -287,36 +293,43 @@ class Recorder:
         if not CFG["record"]:
             return
         os.makedirs(REC_DIR, exist_ok=True)
-        self.active = True
-        self.files = []
         self.title = title or CFG["name"]
         self.start_ts = time.time()
+        self.tmp_ts = os.path.join(REC_DIR, "recording.ts")
+        try:
+            self.fh = open(self.tmp_ts, "wb")
+        except OSError as exc:
+            STATE.set(error=f"record open failed: {exc}")
+            return
+        self.active = True
         log(f"Recording started: {self.title}")
 
     def add(self, ts_path):
-        if not self.active:
+        if not self.active or self.fh is None:
             return
-        dst = os.path.join(REC_DIR, f"r{len(self.files)}.ts")
         try:
-            with open(ts_path, "rb") as s, open(dst, "wb") as d:
-                d.write(s.read())
-            self.files.append(dst)
+            with open(ts_path, "rb") as s:
+                self.fh.write(s.read())
         except OSError as exc:
-            STATE.set(error=f"record copy failed: {exc}")
+            STATE.set(error=f"record append failed: {exc}")
 
     def finish(self):
         if not self.active:
             return
         self.active = False
-        files = self.files
-        self.files = []
-        if not files:
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+        self.fh = None
+        if not self.tmp_ts or not os.path.exists(self.tmp_ts) \
+                or os.path.getsize(self.tmp_ts) == 0:
             return
-        threading.Thread(target=self._harvest,
-                         args=(self.title, self.start_ts, files),
-                         daemon=True).start()
+        threading.Thread(
+            target=self._harvest, args=(self.title, self.start_ts, self.tmp_ts),
+            daemon=True).start()
 
-    def _harvest(self, title, start_ts, files):
+    def _harvest(self, title, start_ts, ts_file):
         try:
             date = datetime.datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d")
             out_dir = os.path.join(CFG["library_dir"], CFG["name"])
@@ -327,27 +340,22 @@ class Recorder:
             while os.path.exists(out):
                 out = os.path.join(out_dir, f"{base} ({n}).mp4")
                 n += 1
-            listf = os.path.join(REC_DIR, "concat.txt")
-            with open(listf, "w") as f:
-                for p in files:
-                    f.write(f"file '{p}'\n")
             tmp = out + ".part"
-            log(f"Harvesting {len(files)} segments -> {out}")
+            log(f"Harvesting recording -> {out}")
             subprocess.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                 "-f", "concat", "-safe", "0", "-i", listf,
-                 "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp],
+                 "-i", ts_file, "-c", "copy", "-movflags", "+faststart",
+                 "-f", "mp4", tmp],
                 check=True)
             os.replace(tmp, out)
             log(f"Harvest complete: {out}")
         except Exception as exc:  # noqa: BLE001
             STATE.set(error=f"harvest failed: {exc}")
         finally:
-            for p in files:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+            try:
+                os.remove(ts_file)
+            except OSError:
+                pass
 
 
 REC = Recorder()
