@@ -65,9 +65,16 @@ build_epg()
     # IFS-whitespace, so an empty title field (live channels) would collapse
     # with the adjacent tab and shift since_ts out of place.
     US="$(printf '\037')"
-    jq -r --arg us "$US" '.[] | [.slug, .name, .state, (.title // ""), (.since_ts // 0 | floor)] | join($us)' \
+    # Programme-level <icon> too: Plex's guide grid / "Shows On Now" use the
+    # programme artwork, not the channel logo.
+    prog_icon()
+    {
+        [ -n "$1" ] && printf '    <icon src="%s" />\n' \
+            "$(printf '%s' "$1" | xml_escape)"
+    }
+    jq -r --arg us "$US" '.[] | [.slug, .name, .state, (.title // ""), (.since_ts // 0 | floor), (.logo // "")] | join($us)' \
         "$status_file" \
-    | while IFS="$US" read -r slug name state title since_ts; do
+    | while IFS="$US" read -r slug name state title since_ts logo; do
         if [ "$state" = "live" ]; then
             [ -n "$title" ] || title="$name live"
             printf '  <programme start="%s" stop="%s" channel="%s">\n' \
@@ -75,6 +82,7 @@ build_epg()
                 "$(xmltv_time "$((now + 4 * 3600))")" "$slug"
             printf '    <title>%s</title>\n' \
                 "$(printf '%s' "$title" | xml_escape)"
+            prog_icon "$logo"
             printf '  </programme>\n'
         else
             # Plex refuses channels without guide data - fill hour blocks.
@@ -85,6 +93,7 @@ build_epg()
                     "$(xmltv_time "$((hour + (i + 1) * 3600))")" "$slug"
                 printf '    <title>%s (no stream)</title>\n' \
                     "$(printf '%s' "$name" | xml_escape)"
+                prog_icon "$logo"
                 printf '  </programme>\n'
                 i=$((i + 1))
             done

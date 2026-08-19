@@ -397,6 +397,10 @@ def render_epg():
         out.append(f'  <programme start="{a.strftime(XMLTV_FMT)}" '
                    f'stop="{b.strftime(XMLTV_FMT)}" channel="{s["slug"]}">')
         out.append(f'    <title>{html.escape(title)}</title>')
+        # Programme-level icon: Plex's guide grid / "Shows On Now" use the
+        # programme artwork, not the channel logo.
+        if s.get("logo"):
+            out.append(f'    <icon src="{html.escape(s["logo"])}" />')
         out.append('  </programme>')
 
     if s["state"] == "live" and s["since"]:
