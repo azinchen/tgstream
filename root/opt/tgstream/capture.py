@@ -684,6 +684,9 @@ class Ffmpeg:
                 "-vaapi_device", CFG["vaapi_device"],
                 "-vf", "format=nv12,hwupload",
                 "-c:v", "h264_vaapi",
+                # No B-frames: they reorder DTS in ways RTMP/FLV consumers
+                # (MediaMTX readers, recorder) reject as non-monotonic.
+                "-bf", "0",
                 "-b:v", CFG["bitrate"], "-maxrate", CFG["bitrate"],
                 "-g", gop,
             ]
