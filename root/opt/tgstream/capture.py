@@ -772,8 +772,11 @@ class Capture:
                            ("TIME_INVALID", "rejoin"),
                            ("GROUPCALL_JOIN_MISSING", "rejoin")):
                 if k in s:
+                    if tag == "rejoin":
+                        log(f"rejoin cause: {k}")
                     return (tag, None)
             if "JoinMissing" in repr(e):
+                log("rejoin cause: JoinMissing")
                 return ("rejoin", None)
             return ("err", repr(e))
 
