@@ -789,8 +789,12 @@ class Capture:
                                 ended["v"] = True
                             big = 0
                     elif status == "small":
+                        # Input-side content drop: the chunk expired before we
+                        # fetched it (we fell behind Telegram's buffer).
+                        log(f"INPUT-SKIP: chunk t={t} expired (TIME_TOO_SMALL)")
                         t += seg
                     elif status == "rejoin":
+                        log("RECONNECT: presence/call rotated, continuing live")
                         # Presence dropped or call rotated: re-resolve and
                         # continue live (a discontinuity, not a slate gap).
                         if (c := await self.live_call()) is None:
