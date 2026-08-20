@@ -546,7 +546,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "video/mp2t")
         self.end_headers()
-        nxt = max(0, HLS.latest_index() - 3)
+        # Start 8 segments back: a client tuning in mid-stall needs enough
+        # buffered real media to establish its pipeline (Plex's MKV remux
+        # stage fails on a ~3s burst followed by null-packet filler).
+        nxt = max(0, HLS.latest_index() - 8)
         idle = 0
         while True:
             seg = os.path.join(HLS_DIR, f"s{nxt}.ts")
@@ -786,8 +789,11 @@ class Capture:
             call=call, time_ms=ts, scale=scale, video_channel=1,
             video_quality=CFG["video_quality"])
         try:
-            res = await self.client(functions.upload.GetFileRequest(
-                location=loc, offset=0, limit=1024 * 1024))
+            # Hard cap: a hanging request on a degraded Telegram server is
+            # dead air the lag watchdog can't see (it only ticks on results).
+            res = await asyncio.wait_for(
+                self.client(functions.upload.GetFileRequest(
+                    location=loc, offset=0, limit=1024 * 1024)), 15)
             return ("ok", res.bytes[32:])
         except RPCError as e:
             s = str(e)
