@@ -302,7 +302,11 @@ class Recorder:
         os.makedirs(REC_DIR, exist_ok=True)
         self.title = title or CFG["name"]
         self.start_ts = time.time()
-        self.tmp_ts = os.path.join(REC_DIR, "recording.ts")
+        # Unique per recording: a fixed name raced the harvest thread when a
+        # stream flapped (begin() truncated the file _harvest was reading,
+        # then _harvest deleted the new recording out from under us).
+        self.tmp_ts = os.path.join(
+            REC_DIR, f"recording-{int(self.start_ts * 1000)}.ts")
         try:
             self.fh = open(self.tmp_ts, "wb")
         except OSError as exc:
@@ -532,6 +536,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", "/login")
         self.end_headers()
 
+    # MPEG-TS null packet (PID 0x1fff): demuxers discard it, but it counts
+    # as data on the wire.
+    TS_NULL = b"\x47\x1f\xff\x10" + b"\xff" * 184
+
     def _serve_continuous_ts(self):
         # Never-ending MPEG-TS for Plex's HDHomeRun client: stream segment
         # files back to back as they are produced, starting near live.
@@ -557,6 +565,15 @@ class Handler(BaseHTTPRequestHandler):
                 idle += 1
                 if idle > 3000:
                     return
+                if idle % 10 == 0:
+                    # Source stall: feed TS null packets so the client's
+                    # read timeout (Plex Transcoder: 30s) doesn't kill the
+                    # session before real data resumes.
+                    try:
+                        self.wfile.write(self.TS_NULL * 16)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
 
     def log_message(self, *a):
         pass
@@ -785,6 +802,12 @@ class Capture:
                 log("rejoin cause: JoinMissing")
                 return ("rejoin", None)
             return ("err", repr(e))
+        except (ValueError, ConnectionError, asyncio.TimeoutError) as e:
+            # Telethon raises a bare ValueError ('Request was unsuccessful
+            # N time(s)') after exhausting its internal retries when
+            # Telegram's stream servers misbehave. That is a transient, not
+            # a reason to tear the stream down to slate.
+            return ("err", repr(e))
 
     async def keepalive(self, get_call, ended):
         # Telegram drops a joined member after ~90s without activity, which
@@ -800,11 +823,13 @@ class Capture:
                 if JOIN_SSRC not in r:
                     log("keepalive: ssrc gone, re-joining")
                     await self.join(call)
-            except RPCError as e:
+            except (RPCError, ValueError, ConnectionError,
+                    asyncio.TimeoutError) as e:
                 log(f"keepalive: {type(e).__name__}, re-joining")
                 try:
                     await self.join(call)
-                except RPCError:
+                except (RPCError, ValueError, ConnectionError,
+                        asyncio.TimeoutError):
                     pass
 
     async def stream_call(self, call):
@@ -825,13 +850,21 @@ class Capture:
                     ch = await self.client(
                         functions.phone.GetGroupCallStreamChannelsRequest(
                             call=state["call"]))
-                except RPCError:
-                    if (c := await self.live_call()) is None:
+                except (RPCError, ValueError, ConnectionError,
+                        asyncio.TimeoutError):
+                    await asyncio.sleep(1)
+                    try:
+                        c = await self.live_call()
+                    except (RPCError, ValueError, ConnectionError,
+                            asyncio.TimeoutError):
+                        continue
+                    if c is None:
                         break
                     state["call"] = c
                     try:
                         await self.join(c)
-                    except RPCError:
+                    except (RPCError, ValueError, ConnectionError,
+                            asyncio.TimeoutError):
                         pass
                     continue
                 if not ch.channels:
@@ -843,26 +876,58 @@ class Capture:
                      - CFG["buffer_ms"])
                 big = 0
                 errs = 0
+                smalls = 0
                 refetch = False
+                # Lag watchdog baseline: wall clock vs media time fetched.
+                base_wall = time.monotonic()
+                base_t = t
                 while not ended["v"] and not refetch:
                     status, data = await self.fetch(state["call"], t, scale)
                     if status == "ok":
                         big = 0
                         errs = 0
+                        smalls = 0
                         await queue.put(data)
                         t += seg
+                        # Slow fetches (degraded Telegram stream servers)
+                        # starve the output long before chunks expire; once
+                        # we drift too far behind realtime, re-seek to the
+                        # live edge instead of limping for minutes.
+                        lag = ((time.monotonic() - base_wall)
+                               - (t - base_t) / 1000.0)
+                        if lag > 20:
+                            log(f"LAG: {lag:.0f}s behind realtime, "
+                                "re-seeking live edge")
+                            refetch = True
                     elif status == "big":
                         await asyncio.sleep(0.2)
+                        # At the live edge (or a source pause) media time
+                        # legitimately stops advancing - reset the lag
+                        # baseline so it only measures fetch slowness.
+                        base_wall = time.monotonic()
+                        base_t = t
                         big += 1
                         if big > 150:
-                            if (await self.live_call()) is None:
-                                ended["v"] = True
+                            try:
+                                if (await self.live_call()) is None:
+                                    ended["v"] = True
+                            except (RPCError, ValueError, ConnectionError,
+                                    asyncio.TimeoutError):
+                                pass
                             big = 0
                     elif status == "small":
                         # Input-side content drop: the chunk expired before we
                         # fetched it (we fell behind Telegram's buffer).
                         log(f"INPUT-SKIP: chunk t={t} expired (TIME_TOO_SMALL)")
                         t += seg
+                        smalls += 1
+                        if smalls >= 5:
+                            # A long expired run means we are far behind the
+                            # retention window; skipping chunk-by-chunk costs
+                            # one round-trip per second of content and races
+                            # the live edge at ~break-even. Jump instead.
+                            log("SEEK-LIVE: expired run, re-seeking live edge")
+                            refetch = True
                     elif status == "rejoin":
                         log("RECONNECT: presence/call rotated, continuing live")
                         # Presence dropped or call rotated: re-resolve and
@@ -871,13 +936,21 @@ class Capture:
                         # marker - tagging one made players re-baseline and
                         # visibly glitch. Discontinuities are only for
                         # slate<->live switches.
-                        if (c := await self.live_call()) is None:
+                        try:
+                            c = await self.live_call()
+                        except (RPCError, ValueError, ConnectionError,
+                                asyncio.TimeoutError):
+                            await asyncio.sleep(1)
+                            refetch = True
+                            continue
+                        if c is None:
                             ended["v"] = True
                             break
                         state["call"] = c
                         try:
                             await self.join(c)
-                        except RPCError:
+                        except (RPCError, ValueError, ConnectionError,
+                                asyncio.TimeoutError):
                             pass
                         refetch = True
                     else:
@@ -894,6 +967,13 @@ class Capture:
                             log("VIDEO-PAUSE: re-resolving stream channels")
                             await asyncio.sleep(1)
                             refetch = True
+                        elif errs % 20 == 0:
+                            # Sustained errors (e.g. Telethon retry
+                            # exhaustion during Telegram server trouble):
+                            # re-resolve and re-seek instead of hammering
+                            # the same timestamp.
+                            await asyncio.sleep(1)
+                            refetch = True
                         else:
                             await asyncio.sleep(0.5)
             ended["v"] = True
@@ -907,10 +987,14 @@ class Capture:
                 await loop.run_in_executor(
                     None, HLS.add, data, REC.add if REC.active else None)
 
-        await asyncio.gather(
-            self.keepalive(lambda: state["call"], ended),
-            producer(), consumer())
-        REC.finish()
+        try:
+            await asyncio.gather(
+                self.keepalive(lambda: state["call"], ended),
+                producer(), consumer())
+        finally:
+            # Also on unexpected errors - otherwise the next begin() clobbers
+            # an unfinished recording and the captured stream is lost.
+            REC.finish()
 
     async def run(self):
         os.makedirs(CFG["state_dir"], exist_ok=True)
