@@ -98,7 +98,8 @@ the live stream will.
 
 Recordings: add `LIBRARY_DIR` as a **TV Shows** library (date-based episode
 ordering in Plex). Files are named
-`<Name> - YYYY-MM-DD - <Stream Title>.mp4` directly in `LIBRARY_DIR`.
+`<Name> - YYYY-MM-DD HH-MM - <Stream Title>.mp4` directly in `LIBRARY_DIR`
+(the title part is dropped when it merely repeats the channel name).
 
 ### Watch directly (VLC, etc.)
 

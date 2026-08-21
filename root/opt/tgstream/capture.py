@@ -342,12 +342,18 @@ class Recorder:
 
     def _harvest(self, title, start_ts, ts_file):
         try:
-            date = datetime.datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d")
+            stamp = datetime.datetime.fromtimestamp(start_ts) \
+                .strftime("%Y-%m-%d %H-%M")
             # Write straight into /library (no per-channel subfolder); mount a
             # subfolder as /library if per-channel separation is wanted.
             out_dir = CFG["library_dir"]
             os.makedirs(out_dir, exist_ok=True)
-            base = f"{CFG['name']} - {date} - {sanitize_title(title)}"
+            base = f"{CFG['name']} - {stamp}"
+            clean_title = sanitize_title(title)
+            # Skip the title when it just repeats the channel name (common on
+            # 24/7 streams where the stream title is the channel title).
+            if clean_title.lower() != CFG["name"].lower():
+                base += f" - {clean_title}"
             out = os.path.join(out_dir, f"{base}.mp4")
             n = 2
             while os.path.exists(out):

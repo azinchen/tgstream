@@ -316,12 +316,15 @@ shared segment volume. Each capture container owns its MTProto session in
 ### 5.4 Recording output
 
 ```
-/tank/media/telegram/<TG_NAME> - YYYY-MM-DD - <Stream Title>.mp4
+/tank/media/telegram/<TG_NAME> - YYYY-MM-DD HH-MM - <Stream Title>.mp4
 ```
 
 Added to Plex and Jellyfin as a **TV Shows** library, date-based episode
-ordering in Plex. Sanitize the stream title for filesystem-hostile characters
-and collide-suffix with ` (2)`.
+ordering in Plex. `HH-MM` is the stream start time — 24/7 channels roll over
+several times a day, so date alone collides and the files sort by name.
+Sanitize the stream title for filesystem-hostile characters, drop it entirely
+when it merely repeats `TG_NAME` (common on 24/7 streams), and collide-suffix
+with ` (2)`.
 
 ---
 
