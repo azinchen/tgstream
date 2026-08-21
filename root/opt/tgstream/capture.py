@@ -1114,11 +1114,13 @@ class Capture:
                                 f"dropping video quality to {quality}")
                             refetch = True
                             continue
-                        # A later chunk already landed while the head keeps
-                        # failing: skip the head (1s hole) instead of
-                        # re-seeking the live edge (tens of seconds lost).
+                        # A later chunk already landed while the head failed:
+                        # skip the head immediately (1s hole). Requiring 3
+                        # failures first (soak 2026-08-21) meant 45s of head
+                        # retries, so the 20s LAG watchdog always won and
+                        # re-seeked away ~22s of fetched backlog each time.
                         nxt = pending.get(t + seg)
-                        if errs >= 3 and nxt is not None and nxt.done() \
+                        if nxt is not None and nxt.done() \
                                 and not nxt.cancelled() \
                                 and nxt.result()[0] == "ok":
                             log(f"INPUT-SKIP: chunk t={t} unfetchable, "
