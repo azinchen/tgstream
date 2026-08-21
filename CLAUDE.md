@@ -311,7 +311,10 @@ comma-separated list of capture base URLs.
 | `/library` | rw | shared; finished recordings |
 
 Live segments live in `/run/tgstream` (tmpfs), rotated automatically — no
-shared segment volume. Each capture container owns its MTProto session in
+shared segment volume. The growing recording TS lives in `/state/rec`
+(persistent, NOT tmpfs): an in-progress recording survives restarts and is
+salvaged (harvested to `/library`) on next startup, with the stream title in
+a `.title` sidecar. Each capture container owns its MTProto session in
 `/state` (one QR scan per channel).
 
 ### 5.4 Recording output

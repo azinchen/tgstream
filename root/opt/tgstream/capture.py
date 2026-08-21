@@ -61,7 +61,10 @@ CFG = {
 
 PATH = f"tg-{CFG['slug']}"
 HLS_DIR = os.path.join(CFG["run_dir"], "hls")
-REC_DIR = os.path.join(CFG["run_dir"], "rec")
+# Recordings grow in /state (persistent volume), NOT tmpfs: an in-progress
+# recording must survive container restarts - salvage() harvests leftovers
+# on startup. tmpfs also meant RAM filling at stream bitrate.
+REC_DIR = os.path.join(CFG["state_dir"], "rec")
 BASE_URL = f"http://{CFG['public_host']}:{CFG['public_http_port']}"
 STREAM_URL = f"{BASE_URL}/stream.m3u8"
 LOGO_SRC = os.path.join(CFG["state_dir"], "logo.jpg")     # square avatar
@@ -340,6 +343,10 @@ class Recorder:
             REC_DIR, f"recording-{int(self.start_ts * 1000)}.ts")
         try:
             self.fh = open(self.tmp_ts, "wb")
+            # Sidecar with the title so a post-restart salvage can name the
+            # file properly (the in-memory title dies with the process).
+            with open(self.tmp_ts + ".title", "w") as m:
+                m.write(self.title)
         except OSError as exc:
             STATE.set(error=f"record open failed: {exc}")
             return
@@ -402,10 +409,43 @@ class Recorder:
         except Exception as exc:  # noqa: BLE001
             STATE.set(error=f"harvest failed: {exc}")
         finally:
+            for f in (ts_file, ts_file + ".title"):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+    def salvage(self):
+        """Harvest recordings a previous container run left behind (restart,
+        crash, redeploy mid-stream). Runs once at startup, before any new
+        recording begins. Truncated TS still remuxes - that is why the
+        recording format is TS."""
+        try:
+            leftovers = sorted(
+                f for f in os.listdir(REC_DIR)
+                if re.fullmatch(r"recording-\d+\.ts", f))
+        except OSError:
+            return
+        for name in leftovers:
+            path = os.path.join(REC_DIR, name)
+            if os.path.getsize(path) == 0:
+                for f in (path, path + ".title"):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+                continue
+            start_ts = int(name[len("recording-"):-len(".ts")]) / 1000.0
             try:
-                os.remove(ts_file)
+                with open(path + ".title") as m:
+                    title = m.read().strip()
             except OSError:
-                pass
+                title = ""
+            log(f"Salvaging interrupted recording {name} "
+                f"({os.path.getsize(path)} bytes)")
+            threading.Thread(
+                target=self._harvest, args=(title, start_ts, path),
+                daemon=True).start()
 
 
 REC = Recorder()
@@ -1132,6 +1172,7 @@ class Capture:
 
 def main():
     start_http()
+    REC.salvage()
     Capture_ = Capture()
     asyncio.run(Capture_.run())
 
