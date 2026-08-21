@@ -892,13 +892,21 @@ class Capture:
 
         async def producer():
             nochan = 0
+            chanerrs = 0
             while not ended["v"]:
                 try:
                     ch = await self.client(
                         functions.phone.GetGroupCallStreamChannelsRequest(
                             call=state["call"]))
                 except (RPCError, ValueError, ConnectionError,
-                        asyncio.TimeoutError):
+                        asyncio.TimeoutError) as e:
+                    # This retry loop was silent too - a call that keeps
+                    # rejecting GetGroupCallStreamChannels spins here forever
+                    # looking exactly like a healthy live capture.
+                    chanerrs += 1
+                    if chanerrs <= 2 or chanerrs % 30 == 0:
+                        log(f"NO-MEDIA: stream channels query failed "
+                            f"(x{chanerrs}): {e!r}")
                     await asyncio.sleep(1)
                     try:
                         c = await self.live_call()
@@ -914,6 +922,7 @@ class Capture:
                             asyncio.TimeoutError):
                         pass
                     continue
+                chanerrs = 0
                 if not ch.channels:
                     # Call exists but serves no stream channels (broadcaster
                     # not sending, or a WebRTC video chat). Silent before -
