@@ -24,6 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import av
+from av.bitstream import BitStreamFilterContext
 from telethon import TelegramClient, functions, types
 from telethon.errors import RPCError, SessionPasswordNeededError
 
@@ -207,20 +208,36 @@ class Hls:
             inp = av.open(io.BytesIO(mp4_bytes), mode="r")
             out = av.open(part, mode="w", format="mpegts")
             omap = {}
+            bsf = None
             for s in inp.streams:
                 if s.type in ("video", "audio"):
                     try:
                         omap[s.index] = out.add_stream_from_template(s)
                     except AttributeError:
                         omap[s.index] = out.add_stream(template=s)
+                    if s.type == "video":
+                        # Explicit AVCC -> Annex-B. libavformat's automatic
+                        # conversion sniffs the first packet's bytes and is
+                        # fooled when an AVCC length prefix happens to look
+                        # like a startcode (e.g. a leading 1-byte NAL =
+                        # 00 00 00 01): the whole segment is then written
+                        # length-prefixed - unplayable video, intact audio.
+                        # The bsf passes real Annex-B input through untouched.
+                        bsf = BitStreamFilterContext("h264_mp4toannexb", s)
             for pkt in inp.demux():
                 if pkt.dts is None or pkt.stream.index not in omap:
                     continue
-                off = int(round(self.off / float(pkt.time_base)))
-                pkt.pts = (pkt.pts or 0) + off
-                pkt.dts = pkt.dts + off
-                pkt.stream = omap[pkt.stream.index]
-                out.mux(pkt)
+                oidx = pkt.stream.index
+                if bsf is not None and pkt.stream.type == "video":
+                    pkts = bsf.filter(pkt)
+                else:
+                    pkts = (pkt,)
+                for p in pkts:
+                    off = int(round(self.off / float(p.time_base)))
+                    p.pts = (p.pts or 0) + off
+                    p.dts = (p.dts or 0) + off
+                    p.stream = omap[oidx]
+                    out.mux(p)
             out.close()
             inp.close()
         except Exception as exc:  # noqa: BLE001
