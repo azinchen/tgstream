@@ -134,6 +134,11 @@ class State:
         self.qr_token = None
         self.password_needed = False
         self.pending_password = None
+        self.last_poll = None
+
+    def poll_tick(self):
+        with self.lock:
+            self.last_poll = time.time()
 
     def set(self, state=None, title=None, error=None):
         with self.lock:
@@ -157,6 +162,8 @@ class State:
                 "since_ts": self.since.timestamp() if self.since else None,
                 "url": STREAM_URL, "logo": logo_url(), "record": CFG["record"],
                 "last_error": self.last_error,
+                "last_poll_age": round(time.time() - self.last_poll, 1)
+                                 if self.last_poll else None,
             }
 
 
@@ -779,8 +786,11 @@ class Capture:
         return cands
 
     async def live_call(self):
-        full = await self.client(
-            functions.channels.GetFullChannelRequest(channel=self.entity))
+        # Same hard cap as fetch(): a hanging request here silently freezes
+        # detection (state stuck "idle", no error, healthcheck green).
+        full = await asyncio.wait_for(self.client(
+            functions.channels.GetFullChannelRequest(channel=self.entity)), 15)
+        STATE.poll_tick()
         return full.full_chat.call
 
     async def join(self, call):
@@ -1036,7 +1046,11 @@ class Capture:
         while True:
             try:
                 call = await self.live_call()
-            except RPCError as e:
+            except (RPCError, ValueError, ConnectionError,
+                    asyncio.TimeoutError) as e:
+                # ValueError covers Telethon's bare 'Request was unsuccessful'
+                # after exhausting internal retries; before this catch a
+                # connection blip at poll time killed the whole process.
                 STATE.set(error=f"detect: {e!r}")
                 await asyncio.sleep(CFG["poll_interval"])
                 continue
