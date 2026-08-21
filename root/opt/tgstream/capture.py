@@ -54,6 +54,10 @@ CFG = {
     "window": int(env("HLS_WINDOW", "16")),
     "grace": int(env("HLS_GRACE", "40")),
     "video_quality": int(env("VIDEO_QUALITY", "2")),
+    # Chunk fetches kept in flight. Sequential fetch turns per-request
+    # latency straight into lost content (10s/chunk = 90% loss); parallel
+    # requests ride out slow stream servers (2026-08-21 sprint quali).
+    "prefetch": int(env("PREFETCH", "8")),
     "state_dir": env("STATE_DIR", "/state"),
     "library_dir": env("LIBRARY_DIR", "/library"),
     "run_dir": env("RUN_DIR", "/run/tgstream"),
@@ -864,10 +868,10 @@ class Capture:
             call=call, join_as=types.InputPeerSelf(), muted=True,
             video_stopped=True, params=types.DataJSON(data=params)))
 
-    async def fetch(self, call, ts, scale):
+    async def fetch(self, call, ts, scale, quality=None):
         loc = types.InputGroupCallStream(
             call=call, time_ms=ts, scale=scale, video_channel=1,
-            video_quality=CFG["video_quality"])
+            video_quality=CFG["video_quality"] if quality is None else quality)
         try:
             # Hard cap: a hanging request on a degraded Telegram server is
             # dead air the lag watchdog can't see (it only ticks on results).
@@ -933,6 +937,10 @@ class Capture:
         async def producer():
             nochan = 0
             chanerrs = 0
+            # Per-stream effective quality: dropped a tier on sustained slow
+            # fetches (degraded resolution beats losing minutes of content).
+            quality = CFG["video_quality"]
+            slow_errs = 0
             while not ended["v"]:
                 try:
                     ch = await self.client(
@@ -986,8 +994,30 @@ class Capture:
                 # Lag watchdog baseline: wall clock vs media time fetched.
                 base_wall = time.monotonic()
                 base_t = t
+                # Sliding window of in-flight chunk fetches. Ordered delivery:
+                # only the head result drives the state machine; prefetches
+                # just warm the pipeline so per-request latency stops gating
+                # throughput.
+                pending = {}
+
+                def spawn(ts):
+                    if ts not in pending:
+                        pending[ts] = asyncio.ensure_future(
+                            self.fetch(state["call"], ts, scale, quality))
+
+                def cancel_pending():
+                    for task in pending.values():
+                        task.cancel()
+                    pending.clear()
+
                 while not ended["v"] and not refetch:
-                    status, data = await self.fetch(state["call"], t, scale)
+                    spawn(t)
+                    if big == 0:
+                        # Prefetch only while flowing: at the live edge the
+                        # lookahead would just burn TIME_TOO_BIG round-trips.
+                        for k in range(1, CFG["prefetch"]):
+                            spawn(t + k * seg)
+                    status, data = await pending.pop(t)
                     if status == "ok":
                         if bigtot >= 60:
                             log(f"MEDIA-RESUME: after ~{bigtot * 0.5:.0f}s at "
@@ -996,6 +1026,9 @@ class Capture:
                         big = 0
                         errs = 0
                         smalls = 0
+                        # Decay, not reset: a slow server still yields the
+                        # occasional chunk and must not dodge the fallback.
+                        slow_errs = max(0, slow_errs - 1)
                         STATE.media_tick()
                         await queue.put(data)
                         t += seg
@@ -1010,6 +1043,7 @@ class Capture:
                                 "re-seeking live edge")
                             refetch = True
                     elif status == "big":
+                        cancel_pending()
                         await asyncio.sleep(0.2)
                         # At the live edge (or a source pause) media time
                         # legitimately stops advancing - reset the lag
@@ -1043,6 +1077,7 @@ class Capture:
                             log("SEEK-LIVE: expired run, re-seeking live edge")
                             refetch = True
                     elif status == "rejoin":
+                        cancel_pending()
                         log("RECONNECT: presence/call rotated, continuing live")
                         # Presence dropped or call rotated: re-resolve and
                         # carry on. The output timeline (HLS.off) is already
@@ -1069,8 +1104,28 @@ class Capture:
                         refetch = True
                     else:
                         errs += 1
+                        slow_errs += 1
                         if errs <= 2 or errs % 40 == 0:
                             log(f"getFile: {data} (x{errs})")
+                        if slow_errs >= 15 and quality > 0:
+                            quality -= 1
+                            slow_errs = 0
+                            log(f"QUALITY-FALLBACK: sustained slow fetches, "
+                                f"dropping video quality to {quality}")
+                            refetch = True
+                            continue
+                        # A later chunk already landed while the head keeps
+                        # failing: skip the head (1s hole) instead of
+                        # re-seeking the live edge (tens of seconds lost).
+                        nxt = pending.get(t + seg)
+                        if errs >= 3 and nxt is not None and nxt.done() \
+                                and not nxt.cancelled() \
+                                and nxt.result()[0] == "ok":
+                            log(f"INPUT-SKIP: chunk t={t} unfetchable, "
+                                "next is ready - skipping")
+                            t += seg
+                            errs = 0
+                            continue
                         if "VIDEO_CHANNEL_INVALID" in (data or "") \
                                 and errs >= 3:
                             # Source paused its video / changed stream params.
@@ -1090,6 +1145,7 @@ class Capture:
                             refetch = True
                         else:
                             await asyncio.sleep(0.5)
+                cancel_pending()
             ended["v"] = True
             await queue.put(None)
 
