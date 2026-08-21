@@ -9,4 +9,12 @@ SCRIPT_NAME="SERVICE-CAPTURE"
 
 log "$SCRIPT_NAME" "Starting capture service for channel '${TG_SLUG:-unset}'"
 
+PUID="${PUID:-0}"
+PGID="${PGID:-0}"
+if [ "$PUID" != "0" ] || [ "$PGID" != "0" ]; then
+    # HOME must be writable for the dropped process (Telethon/PyAV caches).
+    export HOME=/state
+    exec s6-setuidgid "${PUID}:${PGID}" python3 /opt/tgstream/capture.py
+fi
+
 exec python3 /opt/tgstream/capture.py

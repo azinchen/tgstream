@@ -22,5 +22,26 @@ esac
 # integrated QR login (capture.py) fills it on first start.
 make-slate
 
+# PUID/PGID: run the capture process (and its ffmpeg children) as this
+# uid:gid so recordings in /library are not root-owned. Default 0:0 keeps
+# the old run-as-root behavior. svc-capture does the actual privilege drop
+# (s6-setuidgid handles numeric uid:gid without an account entry); the
+# named user here is best-effort cosmetics for ls/ps.
+PUID="${PUID:-0}"
+PGID="${PGID:-0}"
+case "${PUID}${PGID}" in
+    *[!0-9]*) die "$SCRIPT_NAME" "PUID/PGID must be numeric (got '${PUID}:${PGID}')" ;;
+esac
+if [ "$PUID" != "0" ] || [ "$PGID" != "0" ]; then
+    getent group "$PGID" >/dev/null 2>&1 || addgroup -g "$PGID" tgstream 2>/dev/null || true
+    getent passwd "$PUID" >/dev/null 2>&1 || adduser -u "$PUID" -G "$(getent group "$PGID" 2>/dev/null | cut -d: -f1 || echo nogroup)" -D -H -s /sbin/nologin tgstream 2>/dev/null || true
+    log "$SCRIPT_NAME" "Running capture as ${PUID}:${PGID}"
+    chown -R "${PUID}:${PGID}" /run/tgstream /state
+    # Top-level only: /library is a shared media dir; existing files are
+    # left alone, new recordings are created by the dropped process.
+    chown "${PUID}:${PGID}" /library 2>/dev/null || \
+        log "$SCRIPT_NAME" "WARNING: cannot chown /library - recordings may fail if ${PUID}:${PGID} cannot write there"
+fi
+
 log "$SCRIPT_NAME" "Initialization completed for channel '${TG_SLUG}'"
 exit 0

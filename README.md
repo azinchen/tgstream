@@ -124,6 +124,7 @@ fresh channel (new QR login).
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `PUID` / `PGID` | `0` / `0` | run capture as this uid:gid; recordings in `/library` are owned by it (0 = root, the old behavior) |
 | `TG_SLUG` | *required* | `[a-z0-9-]`; stream path is `tg-<slug>` |
 | `TG_PEER` | *required* | channel id, `@username`, or `t.me/+invite` URL |
 | `API_ID` / `API_HASH` | *required* | from my.telegram.org |

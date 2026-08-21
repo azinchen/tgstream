@@ -23,6 +23,8 @@ services:
     container_name: tg-main
     environment:
       - TZ=${TZ}
+      - PUID=${PUID:-0}
+      - PGID=${PGID:-0}
       - TG_SLUG=main
       - TG_PEER=${TG_PEER}
       - TG_NAME=${TG_NAME:-Telegram Main}
