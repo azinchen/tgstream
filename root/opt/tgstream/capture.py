@@ -136,10 +136,15 @@ class State:
         self.password_needed = False
         self.pending_password = None
         self.last_poll = None
+        self.last_media = None
 
     def poll_tick(self):
         with self.lock:
             self.last_poll = time.time()
+
+    def media_tick(self):
+        with self.lock:
+            self.last_media = time.time()
 
     def set(self, state=None, title=None, error=None):
         with self.lock:
@@ -165,6 +170,8 @@ class State:
                 "last_error": self.last_error,
                 "last_poll_age": round(time.time() - self.last_poll, 1)
                                  if self.last_poll else None,
+                "last_media_age": round(time.time() - self.last_media, 1)
+                                  if self.last_media else None,
             }
 
 
@@ -884,6 +891,7 @@ class Capture:
         ended = {"v": False}
 
         async def producer():
+            nochan = 0
             while not ended["v"]:
                 try:
                     ch = await self.client(
@@ -907,13 +915,22 @@ class Capture:
                         pass
                     continue
                 if not ch.channels:
+                    # Call exists but serves no stream channels (broadcaster
+                    # not sending, or a WebRTC video chat). Silent before -
+                    # made FP1's 7-minute source gap undiagnosable.
+                    nochan += 1
+                    if nochan == 5 or nochan % 30 == 0:
+                        log(f"NO-MEDIA: call live but no stream channels "
+                            f"(~{nochan}s)")
                     await asyncio.sleep(1)
                     continue
+                nochan = 0
                 scale = ch.channels[0].scale
                 seg = 1000 >> scale
                 t = ((ch.channels[0].last_timestamp_ms // seg) * seg
                      - CFG["buffer_ms"])
                 big = 0
+                bigtot = 0
                 errs = 0
                 smalls = 0
                 refetch = False
@@ -923,9 +940,14 @@ class Capture:
                 while not ended["v"] and not refetch:
                     status, data = await self.fetch(state["call"], t, scale)
                     if status == "ok":
+                        if bigtot >= 60:
+                            log(f"MEDIA-RESUME: after ~{bigtot * 0.5:.0f}s at "
+                                "the live edge with no new chunks")
+                        bigtot = 0
                         big = 0
                         errs = 0
                         smalls = 0
+                        STATE.media_tick()
                         await queue.put(data)
                         t += seg
                         # Slow fetches (degraded Telegram stream servers)
@@ -946,6 +968,10 @@ class Capture:
                         base_wall = time.monotonic()
                         base_t = t
                         big += 1
+                        bigtot += 1
+                        if bigtot == 60 or bigtot % 600 == 0:
+                            log(f"NO-MEDIA: at live edge, no new chunks for "
+                                f"~{bigtot * 0.5:.0f}s (source paused?)")
                         if big > 150:
                             try:
                                 if (await self.live_call()) is None:
