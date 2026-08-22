@@ -869,16 +869,22 @@ class Capture:
             video_stopped=True, params=types.DataJSON(data=params)))
 
     async def fetch(self, call, ts, scale, quality=None):
+        """Returns (status, data, seconds-the-request-took). The duration
+        feeds the latency-aware quality fallback."""
         loc = types.InputGroupCallStream(
             call=call, time_ms=ts, scale=scale, video_channel=1,
             video_quality=CFG["video_quality"] if quality is None else quality)
+        t0 = time.monotonic()
         try:
             # Hard cap: a hanging request on a degraded Telegram server is
             # dead air the lag watchdog can't see (it only ticks on results).
+            # 30s, not 15: the 2026-08-22 sprint showed Telegram serving
+            # chunks in 15-25s all morning - a 15s cap turned every one of
+            # those slow-but-completing requests into a total loss.
             res = await asyncio.wait_for(
                 self.client(functions.upload.GetFileRequest(
-                    location=loc, offset=0, limit=1024 * 1024)), 15)
-            return ("ok", res.bytes[32:])
+                    location=loc, offset=0, limit=1024 * 1024)), 30)
+            return ("ok", res.bytes[32:], time.monotonic() - t0)
         except RPCError as e:
             s = str(e)
             for k, tag in (("TIME_TOO_BIG", "big"), ("TIME_TOO_SMALL", "small"),
@@ -887,17 +893,17 @@ class Capture:
                 if k in s:
                     if tag == "rejoin":
                         log(f"rejoin cause: {k}")
-                    return (tag, None)
+                    return (tag, None, time.monotonic() - t0)
             if "JoinMissing" in repr(e):
                 log("rejoin cause: JoinMissing")
-                return ("rejoin", None)
-            return ("err", repr(e))
+                return ("rejoin", None, time.monotonic() - t0)
+            return ("err", repr(e), time.monotonic() - t0)
         except (ValueError, ConnectionError, asyncio.TimeoutError) as e:
             # Telethon raises a bare ValueError ('Request was unsuccessful
             # N time(s)') after exhausting its internal retries when
             # Telegram's stream servers misbehave. That is a transient, not
             # a reason to tear the stream down to slate.
-            return ("err", repr(e))
+            return ("err", repr(e), time.monotonic() - t0)
 
     async def keepalive(self, get_call, ended):
         # Telegram drops a joined member after ~90s without activity, which
@@ -1017,7 +1023,7 @@ class Capture:
                         # lookahead would just burn TIME_TOO_BIG round-trips.
                         for k in range(1, CFG["prefetch"]):
                             spawn(t + k * seg)
-                    status, data = await pending.pop(t)
+                    status, data, dur = await pending.pop(t)
                     if status == "ok":
                         if bigtot >= 60:
                             log(f"MEDIA-RESUME: after ~{bigtot * 0.5:.0f}s at "
@@ -1026,12 +1032,29 @@ class Capture:
                         big = 0
                         errs = 0
                         smalls = 0
-                        # Decay, not reset: a slow server still yields the
-                        # occasional chunk and must not dodge the fallback.
-                        slow_errs = max(0, slow_errs - 1)
+                        # Latency-aware: a fetch that succeeds but takes many
+                        # seconds is the degraded-server signature. Counting
+                        # only failures (and decaying on every ok) meant the
+                        # 2026-08-22 sprint - ok/timeout interleaved ~1:1 all
+                        # morning - fired the fallback once, 10s before the
+                        # stream ended.
+                        if dur > 5:
+                            slow_errs += 1
+                        elif dur < 2:
+                            slow_errs = max(0, slow_errs - 1)
                         STATE.media_tick()
                         await queue.put(data)
                         t += seg
+                        if slow_errs >= 15 and quality > 0:
+                            # With the 30s cap most slow fetches now succeed,
+                            # so the fallback must also fire from here, not
+                            # just from the error branch.
+                            quality -= 1
+                            slow_errs = 0
+                            log(f"QUALITY-FALLBACK: sustained slow fetches, "
+                                f"dropping video quality to {quality}")
+                            refetch = True
+                            continue
                         # Slow fetches (degraded Telegram stream servers)
                         # starve the output long before chunks expire; once
                         # we drift too far behind realtime, re-seek to the
@@ -1039,9 +1062,26 @@ class Capture:
                         lag = ((time.monotonic() - base_wall)
                                - (t - base_t) / 1000.0)
                         if lag > 20:
-                            log(f"LAG: {lag:.0f}s behind realtime, "
-                                "re-seeking live edge")
-                            refetch = True
+                            # Salvage the contiguous run of already-completed
+                            # prefetches first: reseeking used to cancel them,
+                            # discarding fetched content (~22s/reseek in the
+                            # 2026-08-21 soak). Each salvaged chunk also
+                            # shrinks the lag - if enough landed, no reseek.
+                            while True:
+                                nxt = pending.get(t)
+                                if nxt is None or not nxt.done() \
+                                        or nxt.cancelled() \
+                                        or nxt.result()[0] != "ok":
+                                    break
+                                await queue.put(pending.pop(t).result()[1])
+                                STATE.media_tick()
+                                t += seg
+                            lag = ((time.monotonic() - base_wall)
+                                   - (t - base_t) / 1000.0)
+                            if lag > 20:
+                                log(f"LAG: {lag:.0f}s behind realtime, "
+                                    "re-seeking live edge")
+                                refetch = True
                     elif status == "big":
                         cancel_pending()
                         await asyncio.sleep(0.2)
