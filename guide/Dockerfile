@@ -2,7 +2,7 @@ ARG IMAGE_VERSION=N/A
 ARG BUILD_DATE=N/A
 
 # s6 overlay builder
-FROM alpine:3.24.1 AS s6-builder
+FROM alpine:3.24.2 AS s6-builder
 
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -13,7 +13,7 @@ ENV PACKAGEVERSION="3.2.3.2"
 RUN echo "**** install mandatory packages ****" && \
     apk --no-cache --no-progress add \
         tar=1.35-r5 \
-        xz=5.8.3-r0 \
+        xz=5.8.4-r0 \
         && \
     echo "**** create folders ****" && \
     mkdir -p /s6 && \
@@ -36,7 +36,7 @@ RUN echo "**** install mandatory packages ****" && \
     tar -C /s6/ -Jxpf /tmp/s6-overlay-symlinks-arch.tar.xz
 
 # rootfs builder
-FROM alpine:3.24.1 AS rootfs-builder
+FROM alpine:3.24.2 AS rootfs-builder
 
 ARG IMAGE_VERSION
 ARG BUILD_DATE
@@ -49,7 +49,7 @@ RUN chmod +x /rootfs/usr/local/bin/* || true && \
 COPY --from=s6-builder /s6/ /rootfs/
 
 # Main image
-FROM alpine:3.24.1
+FROM alpine:3.24.2
 
 ARG IMAGE_VERSION
 ARG BUILD_DATE
@@ -67,9 +67,9 @@ ENV S6_BEHAVIOUR_IF_STAGE2_FAILS=2
 RUN echo "**** install mandatory packages ****" && \
     apk --no-cache --no-progress add \
         busybox-extras=1.37.0-r31 \
-        curl=8.21.0-r0 \
-        jq=1.8.1-r0 \
-        tzdata=2026c-r0 \
+        curl=8.22.0-r0 \
+        jq=1.8.2-r0 \
+        tzdata=2026d-r0 \
         && \
     echo "**** cleanup ****" && \
     rm -rf /tmp/* /var/cache/apk/*
