@@ -129,7 +129,7 @@ jobs:
       # === BUILD AND PUSH PHASE ===
       - name: Build and push image (Development)
         if: ${{ steps.git.outputs.push_latest == 'false' }}
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: ${{ matrix.image.context }}
           platforms: ${{ steps.git.outputs.platforms }}
@@ -144,7 +144,7 @@ jobs:
 
       - name: Build and push image (Production)
         if: ${{ steps.git.outputs.push_latest == 'true' }}
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: ${{ matrix.image.context }}
           platforms: ${{ steps.git.outputs.platforms }}
