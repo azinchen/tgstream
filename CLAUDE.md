@@ -88,8 +88,8 @@ wrong for a public registry). GHCR packages link to the repo via the
 push both images to Docker Hub** (`azinchen/tgstream`, `azinchen/tgstream-guide`)
 and upload the root `README.md` as the repo description of both (user
 directive: one shared README); dev builds stay GHCR-only. Docker Hub
-secrets: `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` (login, cleanup) and
-`DOCKERHUB_PASSWORD` (description upload).
+secrets: `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` (login, cleanup and
+description upload; the token needs read/write/delete scope).
 
 ---
 
