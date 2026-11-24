@@ -81,7 +81,7 @@ RUN echo "**** install mandatory packages ****" && \
         py3-pyaes=1.6.1-r7 \
         py3-rsa=4.9.1-r1 \
         py3-telethon=1.43.2-r0 \
-        python3=3.14.10-r1 \
+        python3=3.14.10-r2 \
         tzdata=2026f-r0 \
         && \
     echo "**** install PyAV (in-process remux; abi3 musllinux wheel) ****" && \
